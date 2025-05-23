@@ -1,0 +1,57 @@
+{
+    "backup_base": "/var/backups/securevault/",
+    "backup_dirs": [
+        "/var/www/",
+        "/etc/apache2/",
+        "/var/log/apache2/",
+        "/etc/nginx/",
+        "/var/log/nginx/",
+        "/etc/postgresql/",
+        "/var/log/postgresql/",
+        "/home/root/",
+        "/etc/systemd/system/"
+    ],
+    "exclude_extensions": [".tmp", ".bak", ".log", ".cache"],
+    "retention_days": 7,
+    "databases": [
+        {
+            "type": "mysql",
+            "user": "root",
+            "password": "",
+            "host": "localhost",
+            "port": 3306
+        },
+        {
+            "type": "postgresql",
+            "user": "postgres",
+            "password": "",
+            "host": "localhost",
+            "port": 5432
+        }
+    ],
+    "schedule": {
+        "type": "daily",
+        "time": "09:29:00",
+        "day_of_week": "monday",
+        "day_of_month": 1
+    },
+    "sftp": {
+        "host": "",
+        "port": 22,
+        "user": "",
+        "password": "",
+        "remote_path": "/backups/securevault/"
+    },
+    "telegram": {
+        "bot_token": "your_bot_token",
+        "chat_id": "your_chat_id"
+    },
+    "email": {
+        "smtp_server": "",
+        "smtp_port": 587,
+        "email_to": "",
+        "email_from": "",
+        "username": "",
+        "password": ""
+    }
+}
