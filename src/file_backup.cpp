@@ -22,6 +22,7 @@
 #include <ranges>
 #include <iostream>
 #include <csignal>
+#include <system_error>
 
 namespace fs = std::filesystem;
 
@@ -105,7 +106,8 @@ void TarGzFileBackupStrategy::backupDirectory(const std::string& dir,
                                               struct archive* archive,
                                               std::atomic<size_t>& processedFiles,
                                               size_t totalFiles,
-                                              std::mutex& mutex) {
+                                              std::mutex& mutex,
+                                              std::atomic<bool>& writeFailed) {
     std::ofstream logFile("backup_files.log", std::ios::app);
     auto now = std::chrono::system_clock::now();
     auto timeT = std::chrono::system_clock::to_time_t(now);
@@ -138,6 +140,10 @@ void TarGzFileBackupStrategy::backupDirectory(const std::string& dir,
     try {
         for (auto it = fs::recursive_directory_iterator(dir, fs::directory_options::skip_permission_denied);
              it != fs::recursive_directory_iterator(); ++it) {
+            if (writeFailed) {
+                break;
+            }
+
             if (gShutdownFlag) {
                 logFile << std::format("[{}] Warning: Backup interrupted by signal, stopping directory processing: {}\n", timeBuf, dir);
                 std::cerr << "Warning: Backup interrupted by signal, stopping directory processing: " << dir << std::endl;
@@ -154,8 +160,24 @@ void TarGzFileBackupStrategy::backupDirectory(const std::string& dir,
             auto fileTime = std::chrono::system_clock::now() - (std::chrono::system_clock::now() - std::chrono::file_clock::to_sys(lastWrite));
             if (!fullBackup && fileTime <= lastBackupTime) continue;
 
+            std::error_code relEc;
+            fs::path relativePath = fs::relative(it->path(), dir, relEc);
+            if (relEc || relativePath.empty()) {
+                logFile << std::format("[{}] Warning: Failed to create relative path for {}, skipping.\n", timeBuf, path);
+                continue;
+            }
+
+            fs::path archivePath = (fs::path(dir).filename() / relativePath).lexically_normal();
+            if (archivePath.is_absolute() ||
+                std::ranges::find(archivePath, fs::path("..")) != archivePath.end()) {
+                logFile << std::format("[{}] Warning: Unsafe archive path derived from {}, skipping.\n", timeBuf, path);
+                continue;
+            }
+
+            const std::string archivePathString = archivePath.generic_string();
+
             struct archive_entry* ae = archive_entry_new();
-            archive_entry_set_pathname(ae, path.c_str());
+            archive_entry_set_pathname(ae, archivePathString.c_str());
             archive_entry_set_size(ae, it->file_size());
             archive_entry_set_filetype(ae, AE_IFREG);
             archive_entry_set_perm(ae, 0644);
@@ -177,15 +199,58 @@ void TarGzFileBackupStrategy::backupDirectory(const std::string& dir,
                     std::cerr << "Warning: Backup interrupted by signal, stopping directory processing: " << dir << std::endl;
                     return;
                 }
-                archive_write_header(archive, ae);
+
+                if (archive_write_header(archive, ae) != ARCHIVE_OK) {
+                    logFile << std::format("[{}] Failed to write archive header for {} (error: {})\n",
+                                           timeBuf,
+                                           archivePathString,
+                                           archive_error_string(archive));
+                    writeFailed = true;
+                    archive_entry_free(ae);
+                    file.close();
+                    break;
+                }
+
                 char buf[8192];
                 while (file && !gShutdownFlag) {
                     file.read(buf, sizeof(buf));
-                    archive_write_data(archive, buf, file.gcount());
+                    std::streamsize bytesRead = file.gcount();
+                    if (bytesRead <= 0) {
+                        continue;
+                    }
+
+                    std::streamsize totalWritten = 0;
+                    while (totalWritten < bytesRead) {
+                        la_ssize_t written = archive_write_data(archive,
+                                                                buf + totalWritten,
+                                                                static_cast<size_t>(bytesRead - totalWritten));
+                        if (written < 0) {
+                            logFile << std::format("[{}] Failed to write archive data for {} (error: {})\n",
+                                                   timeBuf,
+                                                   archivePathString,
+                                                   archive_error_string(archive));
+                            writeFailed = true;
+                            break;
+                        }
+                        totalWritten += written;
+                    }
+
+                    if (writeFailed) {
+                        break;
+                    }
+                }
+
+                if (file.bad()) {
+                    logFile << std::format("[{}] Failed while reading file: {}\n", timeBuf, path);
+                    writeFailed = true;
                 }
             }
             archive_entry_free(ae);
             file.close();
+
+            if (writeFailed) {
+                break;
+            }
 
             if (gShutdownFlag) {
                 logFile << std::format("[{}] Warning: Backup interrupted by signal, stopping directory processing: {}\n", timeBuf, dir);
@@ -235,6 +300,7 @@ std::expected<void, std::string> TarGzFileBackupStrategy::execute(const std::vec
     }
 
     std::atomic<size_t> processedFiles(0);
+    std::atomic<bool> writeFailed(false);
     std::mutex archiveMutex;
 
     struct archive* a = archive_write_new();
@@ -250,8 +316,8 @@ std::expected<void, std::string> TarGzFileBackupStrategy::execute(const std::vec
 
     std::vector<std::thread> threads;
     for (const auto& dir : sourceDirs) {
-        threads.emplace_back([this, &dir, &outputFile, fullBackup, a, &processedFiles, totalFiles, &archiveMutex]() {
-            this->backupDirectory(dir, outputFile, fullBackup, a, processedFiles, totalFiles, archiveMutex);
+        threads.emplace_back([this, &dir, &outputFile, fullBackup, a, &processedFiles, totalFiles, &archiveMutex, &writeFailed]() {
+            this->backupDirectory(dir, outputFile, fullBackup, a, processedFiles, totalFiles, archiveMutex, writeFailed);
         });
     }
 
@@ -267,6 +333,13 @@ std::expected<void, std::string> TarGzFileBackupStrategy::execute(const std::vec
         archive_write_close(a);
         archive_write_free(a);
         return std::unexpected("Backup interrupted by signal");
+    }
+
+    if (writeFailed) {
+        logFile << std::format("[{}] Error: Backup failed due to archive write errors.\n", timeBuf);
+        archive_write_close(a);
+        archive_write_free(a);
+        return std::unexpected("Backup failed due to archive write errors");
     }
 
     archive_write_close(a);

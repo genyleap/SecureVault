@@ -10,6 +10,9 @@ find_path(JsonCpp_INCLUDE_DIR
     NAMES json/json.h
     HINTS
         ${JSONCPP_INCLUDE_DIRS}
+        /opt/homebrew/opt/jsoncpp/include
+        /opt/homebrew/opt/jsoncpp/include/jsoncpp
+        /opt/local/include
         /usr/include/jsoncpp
         /usr/local/include/jsoncpp
 )
@@ -18,6 +21,8 @@ find_library(JsonCpp_LIBRARY
     NAMES jsoncpp
     HINTS
         ${JSONCPP_LIBRARY_DIRS}
+        /opt/homebrew/opt/jsoncpp/lib
+        /opt/local/lib
         /usr/lib
         /usr/lib/x86_64-linux-gnu
         /usr/local/lib

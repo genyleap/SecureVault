@@ -21,18 +21,69 @@ endif()
 # Add custom CMake modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
+option(SECUREVAULT_AUTO_INSTALL_BREW_DEPS "Automatically install missing Homebrew dependencies on macOS" ON)
+
+# Install missing Homebrew dependencies before package discovery.
+if(APPLE AND SECUREVAULT_AUTO_INSTALL_BREW_DEPS)
+    find_program(HOMEBREW_EXECUTABLE brew)
+    if(NOT HOMEBREW_EXECUTABLE)
+        message(FATAL_ERROR "Homebrew is required for automatic dependency installation but was not found. Install Homebrew or configure with -DSECUREVAULT_AUTO_INSTALL_BREW_DEPS=OFF.")
+    endif()
+
+    set(SECUREVAULT_BREW_DEPS
+        libarchive
+        curl
+        zlib
+        jsoncpp
+        libssh
+    )
+
+    foreach(DEP IN LISTS SECUREVAULT_BREW_DEPS)
+        execute_process(
+            COMMAND "${HOMEBREW_EXECUTABLE}" list --formula "${DEP}"
+            RESULT_VARIABLE BREW_HAS_DEP
+            OUTPUT_QUIET
+            ERROR_QUIET
+        )
+
+        if(NOT BREW_HAS_DEP EQUAL 0)
+            message(STATUS "Installing missing Homebrew dependency: ${DEP}")
+            execute_process(
+                COMMAND "${HOMEBREW_EXECUTABLE}" install "${DEP}"
+                RESULT_VARIABLE BREW_INSTALL_RESULT
+                OUTPUT_VARIABLE BREW_INSTALL_STDOUT
+                ERROR_VARIABLE BREW_INSTALL_STDERR
+            )
+            if(NOT BREW_INSTALL_RESULT EQUAL 0)
+                message(FATAL_ERROR "Failed to install '${DEP}' with Homebrew.\n${BREW_INSTALL_STDOUT}\n${BREW_INSTALL_STDERR}")
+            endif()
+        endif()
+
+        execute_process(
+            COMMAND "${HOMEBREW_EXECUTABLE}" --prefix "${DEP}"
+            RESULT_VARIABLE BREW_PREFIX_RESULT
+            OUTPUT_VARIABLE BREW_PREFIX_OUTPUT
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(BREW_PREFIX_RESULT EQUAL 0)
+            list(APPEND CMAKE_PREFIX_PATH "${BREW_PREFIX_OUTPUT}")
+        endif()
+    endforeach()
+endif()
+
 # Add Homebrew paths for macOS (keg-only libraries)
 if(APPLE)
     list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libarchive")
     list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libssh")
-    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libcurl")
+    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/curl")
     list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/zlib")
     list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/jsoncpp")
 endif()
 
 # Find required packages
 find_package(LibArchive REQUIRED)
-find_package(Libssh REQUIRED MODULE)
+find_package(Libssh QUIET MODULE)
 find_package(CURL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(JsonCpp REQUIRED MODULE)
@@ -51,11 +102,17 @@ set(SOURCE_FILES
     src/backup.cpp
     src/database_backup.cpp
     src/file_backup.cpp
-    src/remote_transfer.cpp
     src/notification.cpp
     src/backup_config.cpp
     src/backup_api.cpp
 )
+
+if(Libssh_FOUND)
+    list(APPEND SOURCE_FILES src/remote_transfer.cpp)
+else()
+    message(WARNING "Libssh not found: building without SFTP transfer support")
+    list(APPEND SOURCE_FILES src/remote_transfer_stub.cpp)
+endif()
 
 set(HEADER_FILES
     include/backup.hpp
@@ -72,21 +129,27 @@ add_executable(backup ${SOURCE_FILES} ${HEADER_FILES})
 # Link libraries for main executable
 target_link_libraries(backup PRIVATE
     LibArchive::LibArchive
-    libssh::libssh
     CURL::libcurl
     ZLIB::ZLIB
     jsoncpp
 )
 
+if(Libssh_FOUND)
+    target_link_libraries(backup PRIVATE libssh::libssh)
+endif()
+
 # Include directories for main executable
 target_include_directories(backup PRIVATE
     ${LibArchive_INCLUDE_DIRS}
-    ${Libssh_INCLUDE_DIRS}
     ${CURL_INCLUDE_DIRS}
     ${ZLIB_INCLUDE_DIRS}
     ${JsonCpp_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/include
 )
+
+if(Libssh_FOUND)
+    target_include_directories(backup PRIVATE ${Libssh_INCLUDE_DIRS})
+endif()
 
 # Installation rules
 install(TARGETS backup

@@ -20,9 +20,12 @@
 #include <expected>
 #include <filesystem>
 #include <chrono>
+#include <atomic>
+#include <mutex>
 #include "backup_config.hpp"
 
 namespace fs = std::filesystem;
+struct archive;
 
 /**
  * @brief Abstract base class for database backup strategies.
@@ -177,6 +180,36 @@ public:
 private:
     std::vector<std::string> excludeExtensions; ///< File extensions to exclude.
     std::string lastBackupFile; ///< Path to last backup timestamp file.
+
+    /**
+     * @brief Counts files to back up.
+     *
+     * @param sourceDirs Directories to scan.
+     * @param fullBackup If true, ignores last backup time.
+     * @return size_t Number of files to process.
+     */
+    size_t countFiles(const std::vector<std::string>& sourceDirs, bool fullBackup);
+
+    /**
+     * @brief Backs up a directory in a thread.
+     *
+     * @param dir Directory to back up.
+     * @param outputFile Output .tar.gz file path (unused, kept for interface).
+     * @param fullBackup If true, full backup.
+     * @param archive Shared archive object.
+     * @param processedFiles Processed file counter.
+     * @param totalFiles Total files for progress.
+     * @param mutex Thread-safe archive mutex.
+     * @param writeFailed Shared error flag for archive write failures.
+     */
+    void backupDirectory(const std::string& dir,
+                         const std::string& outputFile,
+                         bool fullBackup,
+                         struct archive* archive,
+                         std::atomic<size_t>& processedFiles,
+                         size_t totalFiles,
+                         std::mutex& mutex,
+                         std::atomic<bool>& writeFailed);
 };
 
 /**
@@ -228,6 +261,13 @@ public:
      * @note Requires libssh. On Windows, install via vcpkg; on macOS, use Homebrew.
      */
     std::expected<void, std::string> transfer(const std::string& sourceFile, const std::string& destinationPath) override;
+
+private:
+    std::string host_; ///< SFTP host address.
+    std::string user_; ///< SFTP username.
+    std::string password_; ///< SFTP password.
+    int port_; ///< SFTP port (e.g., 22).
+    std::string remote_dir_; ///< Remote directory for backups.
 };
 
 /**

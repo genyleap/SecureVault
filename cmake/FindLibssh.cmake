@@ -10,6 +10,8 @@ find_path(Libssh_INCLUDE_DIR
     NAMES libssh/libssh.h
     HINTS
         ${LIBSSH_INCLUDE_DIRS}
+        /opt/homebrew/opt/libssh/include
+        /opt/local/include
         /usr/include
         /usr/local/include
 )
@@ -18,6 +20,8 @@ find_library(Libssh_LIBRARY
     NAMES ssh libssh
     HINTS
         ${LIBSSH_LIBRARY_DIRS}
+        /opt/homebrew/opt/libssh/lib
+        /opt/local/lib
         /usr/lib
         /usr/lib/x86_64-linux-gnu
         /usr/local/lib

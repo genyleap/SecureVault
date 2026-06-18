@@ -42,21 +42,19 @@ void changeOwnership(const std::string& path, const std::string& user, const std
 }
 
 Backup::Backup(const std::string& configFile) : config(configFile) {
-    if (!config.databases.empty()) {
-        const auto& db = config.databases[0];
-        if (db.type == "mysql") {
-            dbStrategy = std::make_unique<MySQLBackupStrategy>(db.user, db.password);
-        } else if (db.type == "postgresql") {
-            dbStrategy = std::make_unique<PostgreSQLBackupStrategy>(db.user, db.password, db.host, db.port);
-        } else {
+    if (config.databases.empty()) {
+        throw std::runtime_error("No database configuration provided");
+    }
+    for (const auto& db : config.databases) {
+        if (db.type != "mysql" && db.type != "postgresql") {
             throw std::runtime_error(std::format("Unsupported database type: {}", db.type));
         }
-    } else {
-        throw std::runtime_error("No database configuration provided");
     }
 
     fileStrategy = std::make_unique<TarGzFileBackupStrategy>(config.excludeExtensions, config.lastBackupFile);
-    if (!config.sftpConfig.empty()) {
+    if (!config.sftpConfig.empty() &&
+        !config.sftpConfig.get("host", "").asString().empty() &&
+        !config.sftpConfig.get("user", "").asString().empty()) {
         transferStrategy = std::make_unique<SFTPTransferStrategy>(config.sftpConfig);
     }
     if (!config.telegramConfig.empty()) {
@@ -88,19 +86,35 @@ std::expected<void, std::string> Backup::execute(const std::string& type, bool f
     std::string targetFilename = std::format("sys-{}-{}-{}.tar.gz", type, dateBuf, timestampBuf);
     std::string targetPath = config.sysBackupFolder + targetFilename;
 
-    std::string dbBaseFilename = std::format("all_databases_{}", timestampBuf);
-    std::string dbTargetPath = config.dbBackupFolder + dbBaseFilename;
-    std::string dbBackupFile;
-    auto dbResult = dbStrategy->execute(dbTargetPath);
-    if (!dbResult) {
-        auto errorMsg = std::format("Database backup failed: {}", dbResult.error());
-        config.logError(errorMsg);
-        if (notificationStrategy) {
-            notificationStrategy->notify(errorMsg);
+    std::vector<std::string> dbBackupFiles;
+    dbBackupFiles.reserve(config.databases.size());
+
+    for (size_t i = 0; i < config.databases.size(); ++i) {
+        const auto& db = config.databases[i];
+        std::unique_ptr<DatabaseBackupStrategy> currentDbStrategy;
+        if (db.type == "mysql") {
+            currentDbStrategy = std::make_unique<MySQLBackupStrategy>(db.user, db.password);
+        } else if (db.type == "postgresql") {
+            currentDbStrategy = std::make_unique<PostgreSQLBackupStrategy>(db.user, db.password, db.host, db.port);
         }
-        std::cerr << "Warning: " << errorMsg << ", proceeding with file backup." << std::endl;
-    } else {
-        dbBackupFile = *dbResult;
+
+        if (!currentDbStrategy) {
+            continue;
+        }
+
+        std::string dbBaseFilename = std::format("{}_all_databases_{}_{}", db.type, i + 1, timestampBuf);
+        std::string dbTargetPath = config.dbBackupFolder + dbBaseFilename;
+        auto dbResult = currentDbStrategy->execute(dbTargetPath);
+        if (!dbResult) {
+            auto errorMsg = std::format("Database backup failed for {} #{}: {}", db.type, i + 1, dbResult.error());
+            config.logError(errorMsg);
+            if (notificationStrategy) {
+                notificationStrategy->notify(errorMsg);
+            }
+            std::cerr << "Warning: " << errorMsg << ", proceeding with remaining backups." << std::endl;
+            continue;
+        }
+        dbBackupFiles.push_back(*dbResult);
     }
 
     auto fileResult = fileStrategy->execute(config.backupDirs, targetPath, fullBackup);
@@ -125,7 +139,7 @@ std::expected<void, std::string> Backup::execute(const std::string& type, bool f
 
     try {
         changeOwnership(targetPath, config.username, config.username);
-        if (!dbBackupFile.empty()) {
+        for (const auto& dbBackupFile : dbBackupFiles) {
             changeOwnership(dbBackupFile, config.username, config.username);
         }
     } catch (const std::exception& e) {
@@ -138,7 +152,7 @@ std::expected<void, std::string> Backup::execute(const std::string& type, bool f
     }
 
     if (transferStrategy) {
-        auto transferResult = transferStrategy->transfer(targetPath, config.sysBackupFolder);
+        auto transferResult = transferStrategy->transfer(targetPath, "sys");
         if (!transferResult) {
             auto errorMsg = std::format("File transfer failed: {}", transferResult.error());
             config.logError(errorMsg);
@@ -146,10 +160,10 @@ std::expected<void, std::string> Backup::execute(const std::string& type, bool f
                 notificationStrategy->notify(errorMsg);
             }
         }
-        if (!dbBackupFile.empty()) {
-            transferResult = transferStrategy->transfer(dbBackupFile, config.dbBackupFolder);
+        for (const auto& dbBackupFile : dbBackupFiles) {
+            transferResult = transferStrategy->transfer(dbBackupFile, "db");
             if (!transferResult) {
-                auto errorMsg = std::format("Database transfer failed: {}", transferResult.error());
+                auto errorMsg = std::format("Database transfer failed for {}: {}", dbBackupFile, transferResult.error());
                 config.logError(errorMsg);
                 if (notificationStrategy) {
                     notificationStrategy->notify(errorMsg);
@@ -167,7 +181,11 @@ std::expected<void, std::string> Backup::execute(const std::string& type, bool f
         }
     }
 
-    auto successMsg = std::format("Backup completed: {} and {}", targetPath, dbBackupFile.empty() ? "no database backup" : dbBackupFile);
+    auto successMsg = std::format("Backup completed: {} and {}",
+                                  targetPath,
+                                  dbBackupFiles.empty()
+                                      ? "no database backups"
+                                      : std::format("{} database backup(s)", dbBackupFiles.size()));
     config.logMessage(successMsg);
     if (notificationStrategy) {
         notificationStrategy->notify(successMsg);
