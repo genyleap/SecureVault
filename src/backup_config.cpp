@@ -5,6 +5,7 @@
 #include <print>
 #ifndef _WIN32
 #include <pwd.h>
+#include <unistd.h>
 #endif
 
 BackupConfig::BackupConfig(const std::string& configFile) {
@@ -58,6 +59,7 @@ BackupConfig::BackupConfig(const std::string& configFile) {
     }
 
     sftpConfig = configJson["sftp"];
+    requireRemote = configJson.get("require_remote", false).asBool();
     telegramConfig = configJson["telegram"];
     emailConfig = configJson["email"];
 
@@ -70,7 +72,7 @@ BackupConfig::BackupConfig(const std::string& configFile) {
 #ifdef _WIN32
     username = "Administrator"; // Default for Windows
 #else
-    struct passwd* pwd = getpwnam("root");
+    struct passwd* pwd = getpwuid(geteuid());
     if (!pwd) {
         throw std::runtime_error("Failed to get current user");
     }

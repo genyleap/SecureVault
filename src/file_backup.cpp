@@ -70,15 +70,17 @@ size_t TarGzFileBackupStrategy::countFiles(const std::vector<std::string>& sourc
             continue;
         }
         try {
-            for (auto it = fs::recursive_directory_iterator(dir, fs::directory_options::skip_permission_denied);
+            for (auto it = fs::recursive_directory_iterator(dir);
                  it != fs::recursive_directory_iterator(); ++it) {
-                if (it->is_regular_file()) {
+                if (it->is_regular_file() || it->is_directory() || it->is_symlink()) {
                     auto ext = it->path().extension().string();
                     if (isExcluded(ext)) continue;
-                    auto lastWrite = fs::last_write_time(*it);
-                    auto fileTime = std::chrono::system_clock::now() - (std::chrono::system_clock::now() - std::chrono::file_clock::to_sys(lastWrite));
-                    if (fullBackup || fileTime > lastBackupTime) {
+                    if (fullBackup) {
                         ++count;
+                    } else {
+                        auto lastWrite = fs::last_write_time(*it);
+                        auto fileTime = std::chrono::system_clock::now() - (std::chrono::system_clock::now() - std::chrono::file_clock::to_sys(lastWrite));
+                        if (fileTime > lastBackupTime) ++count;
                     }
                 }
             }
@@ -116,7 +118,8 @@ void TarGzFileBackupStrategy::backupDirectory(const std::string& dir,
 
     if (!fs::exists(dir)) {
         logFile << std::format("[{}] Warning: Directory does not exist, skipping: {}\n", timeBuf, dir);
-        std::cerr << "Warning: Directory does not exist, skipping: " << dir << std::endl;
+        writeFailed = true;
+        std::cerr << "Error: Required source directory is missing: " << dir << std::endl;
         return;
     }
 
@@ -138,7 +141,7 @@ void TarGzFileBackupStrategy::backupDirectory(const std::string& dir,
     };
 
     try {
-        for (auto it = fs::recursive_directory_iterator(dir, fs::directory_options::skip_permission_denied);
+        for (auto it = fs::recursive_directory_iterator(dir);
              it != fs::recursive_directory_iterator(); ++it) {
             if (writeFailed) {
                 break;
@@ -150,44 +153,58 @@ void TarGzFileBackupStrategy::backupDirectory(const std::string& dir,
                 break;
             }
 
-            if (!it->is_regular_file()) continue;
+            const auto kind = it->symlink_status();
+            const bool isFile = fs::is_regular_file(kind);
+            const bool isDir = fs::is_directory(kind);
+            const bool isLink = fs::is_symlink(kind);
+            if (!isFile && !isDir && !isLink) continue;
 
             std::string path = it->path().string();
             auto ext = it->path().extension().string();
             if (isExcluded(ext)) continue;
 
-            auto lastWrite = fs::last_write_time(*it);
-            auto fileTime = std::chrono::system_clock::now() - (std::chrono::system_clock::now() - std::chrono::file_clock::to_sys(lastWrite));
-            if (!fullBackup && fileTime <= lastBackupTime) continue;
-
-            std::error_code relEc;
-            fs::path relativePath = fs::relative(it->path(), dir, relEc);
-            if (relEc || relativePath.empty()) {
-                logFile << std::format("[{}] Warning: Failed to create relative path for {}, skipping.\n", timeBuf, path);
-                continue;
+            if (!fullBackup) {
+                auto lastWrite = fs::last_write_time(*it);
+                auto fileTime = std::chrono::system_clock::now() - (std::chrono::system_clock::now() - std::chrono::file_clock::to_sys(lastWrite));
+                if (fileTime <= lastBackupTime) continue;
             }
 
-            fs::path archivePath = (fs::path(dir).filename() / relativePath).lexically_normal();
+            fs::path relativePath = it->path().lexically_relative(fs::path(dir));
+            if (relativePath.empty()) {
+                logFile << std::format("[{}] Invalid archive path: {}\n", timeBuf, path);
+                writeFailed = true;
+                break;
+            }
+
+            fs::path archivePath = (fs::path(dir).relative_path() / relativePath).lexically_normal();
             if (archivePath.is_absolute() ||
                 std::ranges::find(archivePath, fs::path("..")) != archivePath.end()) {
-                logFile << std::format("[{}] Warning: Unsafe archive path derived from {}, skipping.\n", timeBuf, path);
-                continue;
+                logFile << std::format("[{}] Unsafe archive path: {}\n", timeBuf, path);
+                writeFailed = true;
+                break;
             }
 
             const std::string archivePathString = archivePath.generic_string();
 
             struct archive_entry* ae = archive_entry_new();
             archive_entry_set_pathname(ae, archivePathString.c_str());
-            archive_entry_set_size(ae, it->file_size());
-            archive_entry_set_filetype(ae, AE_IFREG);
-            archive_entry_set_perm(ae, 0644);
+            archive_entry_set_size(ae, isFile ? it->file_size() : 0);
+            archive_entry_set_filetype(ae, isFile ? AE_IFREG : (isDir ? AE_IFDIR : AE_IFLNK));
+            archive_entry_set_perm(ae, static_cast<int>(kind.permissions()) & 07777);
+            std::string linkTarget;
+            if (isLink) {
+                linkTarget = fs::read_symlink(it->path()).generic_string();
+                archive_entry_set_symlink(ae, linkTarget.c_str());
+            }
 
-            std::ifstream file(path, std::ios::binary);
-            if (!file) {
+            std::ifstream file;
+            if (isFile) file.open(path, std::ios::binary);
+            if (isFile && !file) {
                 std::string errorMsg = std::format("Failed to open file: {} (error: {})", path, strerror(errno));
                 logFile << std::format("[{}] {}\n", timeBuf, errorMsg);
+                writeFailed = true;
                 archive_entry_free(ae);
-                continue;
+                break;
             }
 
             {
@@ -265,7 +282,8 @@ void TarGzFileBackupStrategy::backupDirectory(const std::string& dir,
         }
     } catch (const fs::filesystem_error& e) {
         logFile << std::format("[{}] Warning: Failed to access directory {}: {}, skipping.\n", timeBuf, dir, e.what());
-        std::cerr << "Warning: Failed to access directory " << dir << ": " << e.what() << ", skipping." << std::endl;
+        writeFailed = true;
+        std::cerr << "Error: Failed to access directory " << dir << ": " << e.what() << std::endl;
     }
 }
 
@@ -294,9 +312,7 @@ std::expected<void, std::string> TarGzFileBackupStrategy::execute(const std::vec
     std::println("Counting files...");
     size_t totalFiles = countFiles(sourceDirs, fullBackup);
     if (totalFiles == 0) {
-        logFile << std::format("[{}] Warning: No files to back up.\n", timeBuf);
-        std::cerr << "Warning: No files to back up." << std::endl;
-        return {};
+        return std::unexpected("No regular files found in configured backup directories; refusing an empty backup");
     }
 
     std::atomic<size_t> processedFiles(0);
@@ -316,7 +332,7 @@ std::expected<void, std::string> TarGzFileBackupStrategy::execute(const std::vec
 
     std::vector<std::thread> threads;
     for (const auto& dir : sourceDirs) {
-        threads.emplace_back([this, &dir, &outputFile, fullBackup, a, &processedFiles, totalFiles, &archiveMutex, &writeFailed]() {
+        threads.emplace_back([this, dir, &outputFile, fullBackup, a, &processedFiles, totalFiles, &archiveMutex, &writeFailed]() {
             this->backupDirectory(dir, outputFile, fullBackup, a, processedFiles, totalFiles, archiveMutex, writeFailed);
         });
     }
@@ -332,6 +348,7 @@ std::expected<void, std::string> TarGzFileBackupStrategy::execute(const std::vec
         std::cerr << "Warning: Backup interrupted by signal, closing archive." << std::endl;
         archive_write_close(a);
         archive_write_free(a);
+        fs::remove(outputFile);
         return std::unexpected("Backup interrupted by signal");
     }
 
@@ -339,20 +356,21 @@ std::expected<void, std::string> TarGzFileBackupStrategy::execute(const std::vec
         logFile << std::format("[{}] Error: Backup failed due to archive write errors.\n", timeBuf);
         archive_write_close(a);
         archive_write_free(a);
+        fs::remove(outputFile);
         return std::unexpected("Backup failed due to archive write errors");
     }
 
-    archive_write_close(a);
+    if (archive_write_close(a) != ARCHIVE_OK) {
+        const std::string error = archive_error_string(a) ? archive_error_string(a) : "archive close failed";
+        archive_write_free(a);
+        fs::remove(outputFile);
+        return std::unexpected(error);
+    }
     archive_write_free(a);
     logFile << std::format("[{}] File backup completed: {}\n", timeBuf, outputFile);
     logFile.close();
     std::println("\nFile backup completed.");
 
-    now = std::chrono::system_clock::now();
-    timeT = std::chrono::system_clock::to_time_t(now);
-    std::ofstream lastBackup(lastBackupFile);
-    lastBackup << timeT;
-    lastBackup.close();
-
+    // Do not advance incremental checkpoints here: remote delivery may still fail.
     return {};
 }

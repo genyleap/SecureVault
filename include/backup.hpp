@@ -380,7 +380,7 @@ public:
      * @param fullBackup If true, performs a full backup; otherwise, incremental.
      * @return std::expected<void, std::string> Success or an error message.
      */
-    std::expected<void, std::string> execute(const std::string& type, bool fullBackup = false);
+    std::expected<void, std::string> execute(const std::string& type, bool fullBackup = true);
 
     /**
      * @brief Cleans up old backup files.

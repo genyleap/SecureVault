@@ -8,6 +8,7 @@
 #include <sstream>
 #include <algorithm>
 #include <fcntl.h>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
@@ -130,12 +131,17 @@ std::expected<void, std::string> SFTPTransferStrategy::transfer(const std::strin
     ssh_session ssh = ssh_new();
     sftp_session sftp = nullptr;
     sftp_file file = nullptr;
+    std::string partialFile;
+    bool partialCreated = false;
     auto cleanup = [&]() {
         if (file) {
             sftp_close(file);
             file = nullptr;
         }
         if (sftp) {
+            if (partialCreated) {
+                sftp_unlink(sftp, partialFile.c_str());
+            }
             sftp_free(sftp);
             sftp = nullptr;
         }
@@ -203,7 +209,11 @@ std::expected<void, std::string> SFTPTransferStrategy::transfer(const std::strin
     }
 
     const std::string remote_file = joinRemotePath(destinationDir, fs::path(local_file).filename().string());
-    file = sftp_open(sftp, remote_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    // Never truncate a previously successful backup if this upload is interrupted.
+    partialFile = remote_file + ".partial-" +
+                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    file = sftp_open(sftp, partialFile.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    partialCreated = (file != nullptr);
     if (!file) {
         const std::string error = ssh_get_error(ssh);
         cleanup();
@@ -223,7 +233,7 @@ std::expected<void, std::string> SFTPTransferStrategy::transfer(const std::strin
             const int written = sftp_write(file,
                                            buf + totalWritten,
                                            static_cast<size_t>(bytesRead - totalWritten));
-            if (written < 0) {
+            if (written <= 0) {
                 const std::string error = ssh_get_error(ssh);
                 cleanup();
                 return std::unexpected(std::format("Failed to write remote file '{}': {}", remote_file, error));
@@ -245,6 +255,12 @@ std::expected<void, std::string> SFTPTransferStrategy::transfer(const std::strin
     }
     file = nullptr;
 
+    if (sftp_rename(sftp, partialFile.c_str(), remote_file.c_str()) != SSH_OK) {
+        const std::string error = ssh_get_error(ssh);
+        cleanup();
+        return std::unexpected("Failed to publish verified upload: " + error);
+    }
+    partialCreated = false;
     cleanup();
     std::cout << "Transferred file to remote: " << remote_file << std::endl;
     return {};

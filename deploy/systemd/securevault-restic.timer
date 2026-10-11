@@ -1,0 +1,12 @@
+[Unit]
+Description=Schedule encrypted SecureVault snapshots every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+RandomizedDelaySec=2m
+AccuracySec=1m
+Persistent=true
+Unit=securevault-restic.service
+
+[Install]
+WantedBy=timers.target

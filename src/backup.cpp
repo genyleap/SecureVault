@@ -14,6 +14,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #else
 #include <windows.h>
 #endif
@@ -28,12 +29,20 @@ void signalHandler(int /*sig*/) {
 
 void changeOwnership(const std::string& path, const std::string& user, const std::string& groupName) {
 #ifndef _WIN32
+    (void)groupName;
     struct passwd* pwd = getpwnam(user.c_str());
-    struct group* grp = getgrnam(groupName.c_str());
-    if (!pwd || !grp) {
-        throw std::runtime_error("Invalid user or group");
+    if (!pwd) {
+        throw std::runtime_error("Invalid backup owner");
     }
-    if (chown(path.c_str(), pwd->pw_uid, grp->gr_gid) != 0) {
+    // Unprivileged backups own their output already; do not attempt chown.
+    if (geteuid() != 0) {
+        struct stat st {};
+        if (stat(path.c_str(), &st) != 0 || st.st_uid != geteuid()) {
+            throw std::runtime_error("Backup output is not owned by this user: " + path);
+        }
+        return;
+    }
+    if (chown(path.c_str(), pwd->pw_uid, pwd->pw_gid) != 0) {
         throw std::runtime_error(std::format("Failed to change ownership: {} (error: {})", path, strerror(errno)));
     }
 #else
@@ -42,9 +51,8 @@ void changeOwnership(const std::string& path, const std::string& user, const std
 }
 
 Backup::Backup(const std::string& configFile) : config(configFile) {
-    if (config.databases.empty()) {
-        throw std::runtime_error("No database configuration provided");
-    }
+    // File-only backup profiles are valid; explicit database profiles are
+    // still validated below and fail closed if their dumps fail.
     for (const auto& db : config.databases) {
         if (db.type != "mysql" && db.type != "postgresql") {
             throw std::runtime_error(std::format("Unsupported database type: {}", db.type));
@@ -65,6 +73,12 @@ Backup::Backup(const std::string& configFile) : config(configFile) {
 }
 
 std::expected<void, std::string> Backup::execute(const std::string& type, bool fullBackup) {
+    if (!fullBackup) {
+        return std::unexpected("Unsafe mtime-only incremental backups are disabled. Use --full.");
+    }
+    if (config.requireRemote && !transferStrategy) {
+        return std::unexpected("Remote backup required but no SFTP destination configured.");
+    }
     std::string dateFormat;
     if (type == "daily") {
         dateFormat = "%d";
@@ -111,8 +125,7 @@ std::expected<void, std::string> Backup::execute(const std::string& type, bool f
             if (notificationStrategy) {
                 notificationStrategy->notify(errorMsg);
             }
-            std::cerr << "Warning: " << errorMsg << ", proceeding with remaining backups." << std::endl;
-            continue;
+            return std::unexpected(errorMsg);
         }
         dbBackupFiles.push_back(*dbResult);
     }
@@ -129,7 +142,7 @@ std::expected<void, std::string> Backup::execute(const std::string& type, bool f
 
     auto verifyResult = verifyBackup(targetPath);
     if (!verifyResult || !*verifyResult) {
-        auto errorMsg = std::format("Backup verification failed: {}", verifyResult.error());
+        auto errorMsg = std::format("Backup verification failed: {}", verifyResult ? "archive returned false" : verifyResult.error());
         config.logError(errorMsg);
         if (notificationStrategy) {
             notificationStrategy->notify(errorMsg);
@@ -159,6 +172,7 @@ std::expected<void, std::string> Backup::execute(const std::string& type, bool f
             if (notificationStrategy) {
                 notificationStrategy->notify(errorMsg);
             }
+            return std::unexpected(errorMsg);
         }
         for (const auto& dbBackupFile : dbBackupFiles) {
             transferResult = transferStrategy->transfer(dbBackupFile, "db");
@@ -168,6 +182,7 @@ std::expected<void, std::string> Backup::execute(const std::string& type, bool f
                 if (notificationStrategy) {
                     notificationStrategy->notify(errorMsg);
                 }
+                return std::unexpected(errorMsg);
             }
         }
     }
@@ -179,6 +194,7 @@ std::expected<void, std::string> Backup::execute(const std::string& type, bool f
         if (notificationStrategy) {
             notificationStrategy->notify(errorMsg);
         }
+        return std::unexpected(errorMsg);
     }
 
     auto successMsg = std::format("Backup completed: {} and {}",
@@ -229,15 +245,31 @@ std::expected<bool, std::string> Backup::verifyBackup(const std::string& backupF
         return std::unexpected(errorMsg);
     }
 
-    struct archive_entry* entry;
-    bool success = true;
-    while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
-        archive_read_data_skip(a);
+    struct archive_entry* entry = nullptr;
+    int status = ARCHIVE_OK;
+    size_t entries = 0;
+    char buffer[64 * 1024];
+    while ((status = archive_read_next_header(a, &entry)) == ARCHIVE_OK) {
+        ++entries;
+        la_ssize_t n = 0;
+        while ((n = archive_read_data(a, buffer, sizeof(buffer))) > 0) {}
+        if (n < 0) {
+            const std::string msg = archive_error_string(a) ? archive_error_string(a) : "archive data error";
+            archive_read_free(a);
+            return std::unexpected("Archive data validation failed: " + msg);
+        }
     }
-
-    archive_read_close(a);
+    if (status != ARCHIVE_EOF || entries == 0) {
+        const std::string msg = archive_error_string(a) ? archive_error_string(a) : "empty or truncated archive";
+        archive_read_free(a);
+        return std::unexpected("Archive validation failed: " + msg);
+    }
+    if (archive_read_close(a) != ARCHIVE_OK) {
+        archive_read_free(a);
+        return std::unexpected("Archive close validation failed");
+    }
     archive_read_free(a);
-    return success;
+    return true;
 }
 
 std::chrono::system_clock::time_point Backup::getNextBackupTime() const {
@@ -370,7 +402,7 @@ void Backup::runDaemon() {
                 }
             } else if (!gShutdownFlag) {
                 config.logMessage("Debug: Sleep duration is zero or negative, proceeding to backup immediately");
-                auto result = execute(config.scheduleType);
+                auto result = execute(config.scheduleType, true);
                 if (!result) {
                     config.logError(std::format("Backup failed: {}", result.error()));
                     if (notificationStrategy) {
@@ -396,7 +428,7 @@ void Backup::runDaemon() {
 
 int main(int argc, char* argv[]) {
     bool daemonMode = false;
-    bool fullBackup = false;
+    bool fullBackup = true;
     std::string backupType;
     std::string configFile = "backup_config.json";
 
@@ -406,6 +438,8 @@ int main(int argc, char* argv[]) {
             daemonMode = true;
         } else if (arg == "--full") {
             fullBackup = true;
+        } else if (arg == "--incremental") {
+            fullBackup = false;
         } else if (arg == "--config" && i + 1 < argc) {
             configFile = argv[++i];
         } else {
@@ -429,7 +463,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (!daemonMode) {
-        auto result = BackupAPI::startBackup(backupType, fullBackup);
+        auto result = BackupAPI::startBackup(backupType, fullBackup, configFile);
         if (!result) {
             std::cerr << "Error: " << result.error() << std::endl;
             return 1;

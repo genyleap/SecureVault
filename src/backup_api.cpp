@@ -2,9 +2,9 @@
 #include "backup.hpp"
 #include <fstream>
 
-std::expected<void, std::string> BackupAPI::startBackup(const std::string& type, bool fullBackup) {
+std::expected<void, std::string> BackupAPI::startBackup(const std::string& type, bool fullBackup, const std::string& configFile) {
     try {
-        Backup backup("backup_config.json");
+        Backup backup(configFile);
         return backup.execute(type, fullBackup);
     } catch (const std::exception& e) {
         return std::unexpected(std::format("Failed to start backup: {}", e.what()));

@@ -86,6 +86,7 @@ public:
     std::string lastBackupFile;                     ///< Path to the last backup timestamp file.
     std::vector<DatabaseConfig> databases;          ///< List of database configurations.
     Json::Value sftpConfig;                         ///< SFTP configuration for remote transfers.
+    bool requireRemote = false;                     ///< Refuse to succeed without configured off-site storage.
     Json::Value telegramConfig;                     ///< Telegram configuration for notifications.
     Json::Value emailConfig;                        ///< Email configuration for notifications.
     std::string scheduleType;                       ///< Schedule type ("daily", "weekly", "monthly").

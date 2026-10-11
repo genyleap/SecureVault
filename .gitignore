@@ -48,3 +48,8 @@ application-cms/
 tegra-cms/
 dynamics/
 CMakeLists.txt.user
+
+# SecureVault CI/hardening build artifacts
+build-hardening/
+__pycache__/
+*.pyc

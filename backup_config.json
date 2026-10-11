@@ -2,17 +2,18 @@
     "backup_base": "/var/backups/securevault/",
     "backup_dirs": [
         "/var/www/",
-        "/etc/apache2/",
-        "/var/log/apache2/",
+        "/opt/",
         "/etc/nginx/",
-        "/var/log/nginx/",
+        "/etc/systemd/system/",
         "/etc/postgresql/",
-        "/var/log/postgresql/",
-        "/home/root/",
-        "/etc/systemd/system/"
+        "/etc/mysql/",
+        "/boot/"
     ],
-    "exclude_extensions": [".tmp", ".bak", ".log", ".cache"],
-    "retention_days": 7,
+    "exclude_extensions": [
+        ".tmp",
+        ".cache"
+    ],
+    "retention_days": 30,
     "databases": [
         {
             "type": "mysql",
@@ -53,5 +54,6 @@
         "email_from": "",
         "username": "",
         "password": ""
-    }
+    },
+    "require_remote": true
 }

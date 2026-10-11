@@ -34,7 +34,7 @@ public:
      * @param fullBackup If true, performs a full backup; otherwise, incremental.
      * @return std::expected<void, std::string> Success or an error message.
      */
-    static std::expected<void, std::string> startBackup(const std::string& type, bool fullBackup = false);
+    static std::expected<void, std::string> startBackup(const std::string& type, bool fullBackup = true, const std::string& configFile = "backup_config.json");
 
     /**
      * @brief Updates the backup schedule.

@@ -75,25 +75,42 @@ std::expected<fs::path, std::string> createSecureTempFile(const std::string& pre
             continue;
         }
 
+#ifdef _WIN32
+        // TODO: replace with CreateFile(CREATE_NEW) and restrictive ACLs.
         std::ofstream out(candidate, std::ios::binary | std::ios::trunc);
-        if (!out.is_open()) {
-            continue;
-        }
+        if (!out) continue;
         out.write(content.data(), static_cast<std::streamsize>(content.size()));
         out.close();
         if (!out) {
             fs::remove(candidate, ec);
             continue;
         }
-
-#ifndef _WIN32
-        fs::permissions(candidate,
-                        fs::perms::owner_read | fs::perms::owner_write,
-                        fs::perm_options::replace,
-                        ec);
-        if (ec) {
+#else
+        // Exclusive creation prevents credential-file symlink attacks.
+        int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+        const int fd = ::open(candidate.c_str(), flags, S_IRUSR | S_IWUSR);
+        if (fd < 0) {
+            if (errno == EEXIST) continue;
+            return std::unexpected("Cannot securely create credentials file: " + std::string(strerror(errno)));
+        }
+        size_t offset = 0;
+        bool success = true;
+        while (offset < content.size()) {
+            const auto written = ::write(fd, content.data() + offset, content.size() - offset);
+            if (written <= 0) {
+                if (written < 0 && errno == EINTR) continue;
+                success = false;
+                break;
+            }
+            offset += static_cast<size_t>(written);
+        }
+        if (::close(fd) != 0) success = false;
+        if (!success) {
             fs::remove(candidate, ec);
-            return std::unexpected(std::format("Failed to set secure temp file permissions: {}", ec.message()));
+            return std::unexpected("Unable to write secure credentials file");
         }
 #endif
 
@@ -188,6 +205,10 @@ std::expected<void, std::string> runCommandWithRedirect(
             _exit(127);
         }
         ::close(outputFd);
+
+        // Do not allow injected SDK paths to affect database dump tools.
+        ::unsetenv("LD_LIBRARY_PATH");
+        ::unsetenv("LD_PRELOAD");
 
         if (envVar && ::setenv(envVar->first.c_str(), envVar->second.c_str(), 1) != 0) {
             _exit(127);

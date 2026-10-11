@@ -1,5 +1,38 @@
 # SecureVault Backup System
 
+> **Hardening development branch — not yet production-certified.** The automated backup
+> runner has been changed to fail closed on database/remote-transfer errors.
+> The old mtime-only incremental mode is intentionally disabled until a
+> restorable manifest-based design or Restic backend is integrated.
+> The built-in tar/SQL output is **not encrypted at rest**. Store it only on
+> trusted encrypted media; do not expose backup files via the web.
+>
+> Read [DISASTER-RECOVERY.md](DISASTER-RECOVERY.md) for a recovery strategy,
+> prerequisites and a deployment checklist. No backup job is enabled merely
+> by cloning or compiling this repository.
+
+### Hardening updates
+
+- Manual `--config /absolute/path.json` now reaches the executor.
+- `backup daily` runs a **full** snapshot by default; `--incremental`
+  explicitly fails until safe incremental retention/deletion tracking exists.
+- `require_remote: true` makes an absent SFTP destination or failed upload
+  a hard failure instead of a false-positive success.
+- Archive verification reads all payload bytes and rejects malformed or
+  empty archives. Local directory unreadability is treated as failure.
+- Full file archives now retain directory entries, symbolic links, relative
+  paths and original POSIX permission bits.
+- Database credential temporary files are exclusively created with mode 0600
+  on POSIX. Database tools execute without inherited `LD_LIBRARY_PATH`.
+- SFTP uploads use a temporary remote name and publish only after complete
+  transfer. Test coverage is under `tests/` and GitHub Actions CI.
+
+**Still missing for production**: authenticated encrypted-at-rest repository,
+point-in-time database recovery using WAL/binlogs, off-host immutable copies,
+verified restore drills and cross-platform security review. Treat these as
+release blockers, not optional enhancements.
+
+
 **SecureVault** is a robust, cross-platform backup solution designed for automated, secure, and efficient backups of files and databases. Written in modern C++23, it supports Linux, Windows, and macOS, offering flexible scheduling, incremental backups, database support (MySQL, PostgreSQL), remote transfers via SFTP, and notifications via Telegram or email. SecureVault is ideal for system administrators and developers needing a reliable backup tool for critical data.
 
 ## Features
@@ -140,7 +173,7 @@ SecureVault uses a JSON configuration file (`backup_config.json`) to define back
 backup [--config <path>] [--full] {daily|monthly|yearly}
 ```
 - `--config <path>`: Specify a custom configuration file path.
-- `--full`: Perform a full backup (default is incremental).
+- `--full`: Perform a full backup (default is full; unsafe legacy incremental is disabled).
 - `daily|monthly|yearly`: Backup type.
 
 Example:

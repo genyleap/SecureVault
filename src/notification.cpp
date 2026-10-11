@@ -36,6 +36,6 @@ EmailNotificationStrategy::EmailNotificationStrategy(const Json::Value& config)
     : emailTo(config["email_to"].asString()), smtpServer(config["smtp_server"].asString()) {}
 
 std::expected<void, std::string> EmailNotificationStrategy::notify(const std::string& message) {
-    std::println("Simulated email sent to {} via {}: {}", emailTo, smtpServer, message);
-    return {};
+    (void)message;
+    return std::unexpected("SMTP delivery is not implemented; refusing simulated success for " + emailTo);
 }
