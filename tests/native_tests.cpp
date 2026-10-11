@@ -175,8 +175,24 @@ int main(int argc, char** argv) {
     setenv("SV_MOCK_SAFE_SYMLINK", "1", 1);
     const auto safe_link_target = temp.dir / "safe-symlink-dest";
     auto safe_link = restic_restore(std::string(64, 'a'), "files", safe_link_target, false);
+    if (!safe_link) std::cerr << "Safe symlink restore error: " << safe_link.error() << '\n';
     check(safe_link && fs::is_symlink(safe_link_target / "var" / "www" / "safe-link"),
           "Relative in-root symlinks remain supported");
+
+    // Simulates macOS /var -> /private/var: the staged path contains an
+    // existing symlink in an ANCESTOR, not in the recovered archive.
+    // Canonicalizing only the staging root used to reject this incorrectly.
+    const auto actual_parent = temp.dir / "actual-parent" / "inside";
+    fs::create_directories(actual_parent);
+    const auto aliased_parent = temp.dir / "aliased-parent";
+    fs::create_symlink(temp.dir / "actual-parent", aliased_parent);
+    const auto aliased_target = aliased_parent / "inside" / "restored";
+    auto aliased_restore = restic_restore(std::string(64, 'a'), "files",
+                                          aliased_target, false);
+    if (!aliased_restore)
+        std::cerr << "Symlinked-ancestor restore error: " << aliased_restore.error() << '\n';
+    check(aliased_restore && fs::is_symlink(aliased_target / "var" / "www" / "safe-link"),
+          "Safe relative symlinks work with canonicalization aliases in parent paths");
     unsetenv("SV_MOCK_SAFE_SYMLINK");
 
     setenv("SV_MOCK_SPECIAL_FIFO", "1", 1);

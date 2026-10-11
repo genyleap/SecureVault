@@ -93,8 +93,14 @@ std::expected<void, std::string> exclusive_publish(const fs::path& from, const f
 }
 std::expected<void, std::string> safe_restored_tree(const fs::path& stage) {
     std::error_code ec;
-    const auto root = fs::weakly_canonical(stage, ec);
-    if (ec) return std::unexpected("Cannot determine extraction root");
+    // Compare paths in the SAME namespace. On macOS /var is commonly a
+    // symlink to /private/var: weakly_canonical(stage) would change that
+    // prefix, while recursive_directory_iterator returns the original
+    // /var-based paths. The mismatch falsely rejects safe relative links.
+    // The stage is an absolute private directory; do not follow restored
+    // symlinks and only perform lexical containment checks within it.
+    const auto root = stage.lexically_normal();
+    if (!root.is_absolute()) return std::unexpected("Extraction root must be absolute");
 
     // Do not follow directory symlinks. Restic restores metadata too, so
     // reject devices, sockets, FIFOs, and hardlinks before publishing files.
