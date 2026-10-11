@@ -47,12 +47,14 @@ Test access, cost, capacity and restoration before scheduling anything.
 The three logical/file Restic snapshots share a generation tag but are not
 a transactionally atomic multi-database checkpoint. A fourth encrypted
 `generation-committed` snapshot is written only after those three stages
-succeed. `securevault-ops restic generations` requires all four kinds to
-report `COMPLETE`, preventing a successfully uploaded *partial* SQL stream
-from making a failed run appear complete. This marker indicates workflow
-completion only; it is not a substitute for a full `restic check --read-data`
-and an independent restore drill. Older generations without the marker are
-conservatively reported `INCOMPLETE`.
+succeed, containing a v2 JSON manifest with all three full snapshot IDs.
+`securevault-ops restic generations` reads the encrypted manifest through
+`restic dump` and checks that each listed ID matches exactly one component
+snapshot in the repository. A missing or inaccessible manifest, duplicate
+kind, or mismatch fails closed as `INCOMPLETE`. This verifies the identity
+of the completed workflow, **not** a full cryptographic repository check
+or a successful disaster-recovery drill. Older v1 or markerless generations
+are conservatively shown as `INCOMPLETE` without deleting their data.
 
 The log retention policy must be established separately; do not blindly
 run `forget --prune` on object-locked buckets.

@@ -416,34 +416,104 @@ Result restic_list() {
     if (!ready) return std::unexpected(ready.error());
     return snapshots();
 }
+Result restic_generation_snapshot_ids(const std::string& generation) {
+    static const std::regex stamp("^[0-9]{8}T[0-9]{6}Z$");
+    if (!std::regex_match(generation, stamp))
+        return std::unexpected("Invalid SecureVault generation stamp");
+    auto inventory = restic_list();
+    if (!inventory) return inventory;
+    Json::Value ids(Json::objectValue);
+    for (const auto& snapshot : *inventory) {
+        if (!tagged(snapshot, generation)) continue;
+        for (const char* kind : {"files", "postgresql", "mariadb"}) {
+            if (!tagged(snapshot, kind)) continue;
+            if (ids.isMember(kind))
+                return std::unexpected("Duplicate snapshot kind in one generation");
+            ids[kind] = snapshot["id"];
+        }
+    }
+    if (ids.size() != 3)
+        return std::unexpected("Missing data snapshot in the generation");
+    return ids;
+}
+
 Result restic_generations() {
     auto inventory = restic_list();
     if (!inventory) return inventory;
-    std::map<std::string, std::set<std::string>, std::greater<>> generations;
+    struct Generation {
+        std::map<std::string, std::vector<Json::Value>> kinds;
+    };
+    std::map<std::string, Generation, std::greater<>> generations;
     const std::regex stamp("^[0-9]{8}T[0-9]{6}Z$");
     for (const auto& snapshot : *inventory) {
-        std::string gen;
+        std::string generation;
         for (const auto& tag : snapshot["tags"]) {
             if (tag.isString() && std::regex_match(tag.asString(), stamp)) {
-                gen = tag.asString();
+                generation = tag.asString();
                 break;
             }
         }
-        if (gen.empty()) continue;
-        for (const auto& kind : {"files", "postgresql", "mariadb",
-                                 "generation-committed"})
-            if (tagged(snapshot, kind)) generations[gen].insert(kind);
+        if (generation.empty()) continue;
+        for (const char* kind : {"files", "postgresql", "mariadb",
+                                 "generation-committed"}) {
+            if (tagged(snapshot, kind))
+                generations[generation].kinds[kind].push_back(snapshot);
+        }
     }
     Json::Value result(Json::arrayValue);
-    for (const auto& [stamp, kinds] : generations) {
+    for (const auto& [stamp, generation] : generations) {
         Json::Value record;
         record["generation"] = stamp;
-        // Three snapshots alone can exist after a failed dump/stream.
-        // Only a final encrypted Restic commit marker makes a generation
-        // eligible to be reported complete. Completeness is not integrity.
-        record["committed"] = kinds.contains("generation-committed");
-        record["status"] = kinds.size() == 4 ? "COMPLETE" : "INCOMPLETE";
-        for (const auto& kind : kinds) record["kinds"].append(kind);
+        record["committed"] = false;
+        record["status"] = "INCOMPLETE";
+        for (const auto& [kind, items] : generation.kinds)
+            record["kinds"].append(kind);
+
+        bool unique = generation.kinds.size() == 4;
+        for (const char* kind : {"files", "postgresql", "mariadb",
+                                 "generation-committed"}) {
+            const auto it = generation.kinds.find(kind);
+            if (it == generation.kinds.end() || it->second.size() != 1)
+                unique = false;
+        }
+        if (unique) {
+            const auto& marker = generation.kinds.at("generation-committed").front();
+            // The marker snapshot must contain just a single private JSON file
+            // created by this coordinator. Do not accept arbitrary dump paths.
+            const auto& paths = marker["paths"];
+            const std::string path =
+                paths.isArray() && paths.size() == 1 && paths[0].isString()
+                ? paths[0].asString() : "";
+            if (path.starts_with("/var/lib/securevault/.generation-") &&
+                path.find("..") == std::string::npos &&
+                path.size() < 512) {
+                const auto dump = execute(
+                    {"restic", "dump", marker["id"].asString(), path},
+                    true, std::chrono::seconds{120});
+                if (dump && dump->exit_code == 0) {
+                    const auto manifest = parse_json(dump->out);
+                    if (manifest && manifest->isObject() &&
+                        (*manifest).get("schema", "").asString() ==
+                            "securevault.restic.generation.v2" &&
+                        (*manifest).get("generation", "").asString() == stamp &&
+                        (*manifest)["snapshots"].isObject()) {
+                        const auto& ids = (*manifest)["snapshots"];
+                        bool matched = ids.size() == 3;
+                        for (const char* kind : {"files", "postgresql", "mariadb"}) {
+                            const auto expected_id =
+                                generation.kinds.at(kind).front()["id"].asString();
+                            matched = matched && ids[kind].isString() &&
+                                      ids[kind].asString() == expected_id;
+                        }
+                        if (matched) {
+                            record["committed"] = true;
+                            record["status"] = "COMPLETE";
+                            record["snapshots"] = ids;
+                        }
+                    }
+                }
+            }
+        }
         result.append(record);
     }
     return result;

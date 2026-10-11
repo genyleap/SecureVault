@@ -51,11 +51,25 @@ int mocked(int argc, char** argv) {
                 "{\"id\":\"" << b << "\",\"tags\":[\"securevault\",\"postgresql\",\"20261011T090000Z\"]}"
                 << (std::getenv("SV_MOCK_MISSING_MARIA") ? "" :
                     ",{\"id\":\"" + c + "\",\"tags\":[\"securevault\",\"mariadb\",\"20261011T090000Z\"]}")
+                << (std::getenv("SV_MOCK_DUPLICATE_FILES") ?
+                    ",{\"id\":\"" + std::string(64, 'e') +
+                    "\",\"tags\":[\"securevault\",\"files\",\"20261011T090000Z\"]}" : "")
                 << (std::getenv("SV_MOCK_MISSING_COMMIT") ? "" :
                     ",{\"id\":\"" + d + "\",\"tags\":[\"securevault\",\"generation-committed\"," +
                     (std::getenv("SV_MOCK_MIXED_COMMIT_KIND") ? "\"files\"," : "") +
-                    "\"20261011T090000Z\"]}")
+                    "\"20261011T090000Z\"],\"paths\":[\"/var/lib/securevault/.generation-test\"]}")
                 << "]\n";
+        } else if (action == "dump") {
+            if (std::getenv("SV_MOCK_DUMP_FAIL")) return 19;
+            Json::Value manifest;
+            manifest["schema"] = "securevault.restic.generation.v2";
+            manifest["generation"] = "20261011T090000Z";
+            manifest["snapshots"]["files"] = std::getenv("SV_MOCK_WRONG_FILE_ID") ?
+                std::string(64, 'f') : a;
+            manifest["snapshots"]["postgresql"] = b;
+            manifest["snapshots"]["mariadb"] = c;
+            Json::StreamWriterBuilder json_writer;
+            std::cout << Json::writeString(json_writer, manifest);
         } else if (action == "restore") {
             std::string target;
             for (int i = 2; i + 1 < argc; ++i)
@@ -155,7 +169,27 @@ int main(int argc, char** argv) {
     check(groups && groups->size() == 1 &&
           (*groups)[0]["status"].asString() == "COMPLETE" &&
           (*groups)[0]["committed"].asBool(),
-          "Generation is complete only with the final encrypted commit marker");
+          "Generation is complete only when marker contents match all snapshot IDs");
+    auto ids = restic_generation_snapshot_ids("20261011T090000Z");
+    check(ids && (*ids)["files"].asString() == std::string(64, 'a') &&
+          (*ids)["mariadb"].asString() == std::string(64, 'c'),
+          "Distinct snapshot IDs can be collected for a strict generation manifest");
+    setenv("SV_MOCK_WRONG_FILE_ID", "1", 1);
+    auto wrong_id = restic_generations();
+    check(wrong_id && (*wrong_id)[0]["status"].asString() == "INCOMPLETE",
+          "A marker referring to a different file snapshot must be rejected");
+    unsetenv("SV_MOCK_WRONG_FILE_ID");
+    setenv("SV_MOCK_DUMP_FAIL", "1", 1);
+    auto dump_failure = restic_generations();
+    check(dump_failure && (*dump_failure)[0]["status"].asString() == "INCOMPLETE",
+          "Unverifiable encrypted marker never means complete");
+    unsetenv("SV_MOCK_DUMP_FAIL");
+    setenv("SV_MOCK_DUPLICATE_FILES", "1", 1);
+    auto duplicates = restic_generations();
+    check(duplicates && (*duplicates)[0]["status"].asString() == "INCOMPLETE" &&
+          !restic_generation_snapshot_ids("20261011T090000Z"),
+          "Duplicate snapshots of one kind cannot create a committed generation");
+    unsetenv("SV_MOCK_DUPLICATE_FILES");
     setenv("SV_MOCK_MISSING_COMMIT", "1", 1);
     auto uncommitted = restic_generations();
     check(uncommitted && uncommitted->size() == 1 &&

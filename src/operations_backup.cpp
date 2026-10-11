@@ -61,13 +61,12 @@ std::expected<fs::path, std::string> write_private_temp(
     }
     return file;
 }
-std::expected<void, std::string> commit_generation(const std::string& stamp) {
+std::expected<void, std::string> commit_generation(
+    const std::string& stamp, const Json::Value& ids) {
     Json::Value manifest;
-    manifest["schema"] = "securevault.restic.generation.v1";
+    manifest["schema"] = "securevault.restic.generation.v2";
     manifest["generation"] = stamp;
-    manifest["files"] = true;
-    manifest["postgresql"] = true;
-    manifest["mariadb"] = true;
+    manifest["snapshots"] = ids;
     manifest["transactionally_consistent"] = false;
     Json::StreamWriterBuilder writer;
     auto file = write_private_temp("/var/lib/securevault", ".generation-",
@@ -152,7 +151,11 @@ Result restic_backup() {
 
     // Three Restic snapshots may exist after a failed producer;
     // only this final encrypted marker commits the generation.
-    const auto committed = commit_generation(stamp);
+    // Verify that exactly one data snapshot of each kind reached remote
+    // storage before sealing the generation. A duplicate stamp fails closed.
+    const auto ids = restic_generation_snapshot_ids(stamp);
+    if (!ids) return std::unexpected(ids.error());
+    const auto committed = commit_generation(stamp, *ids);
     if (!committed) return std::unexpected(committed.error());
     auto saved = save_success("/var/lib/securevault/last_success", stamp);
     if (!saved) return std::unexpected(saved.error());

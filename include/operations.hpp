@@ -26,6 +26,7 @@ Json::Value error_json(const std::string& message);
 
 Result restic_list();
 Result restic_generations();
+Result restic_generation_snapshot_ids(const std::string& generation);
 Result restic_check();
 Result restic_restore(const std::string& id, const std::string& kind,
                       const fs::path& destination, bool allow_plaintext);
