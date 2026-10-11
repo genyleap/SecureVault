@@ -215,6 +215,15 @@ std::expected<void, std::string> Backup::cleanupOldBackups() {
     auto threshold = now - std::chrono::hours(24 * config.retentionDays);
 
     for (const auto& folder : {config.sysBackupFolder, config.dbBackupFolder}) {
+        // A file-only profile never creates dbBackupFolder. Its absence
+        // is expected, not a retention error. Any other missing directory
+        // must still fail rather than silently skipping cleanup.
+        if (!fs::exists(folder)) {
+            if (folder == config.dbBackupFolder && config.databases.empty()) {
+                continue;
+            }
+            return std::unexpected("Required backup directory missing during cleanup: " + folder);
+        }
         for (const auto& entry : fs::directory_iterator(folder)) {
             if (entry.is_regular_file()) {
                 auto lastWrite = fs::last_write_time(entry);

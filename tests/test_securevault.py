@@ -91,6 +91,15 @@ class BackupTests(unittest.TestCase):
         self.assertNotIn("Backup completed successfully", result.stdout)
         self.assertFalse(list(self.destination.glob("sys/*.tar.gz")))
 
+    def test_file_only_cleanup_without_database_directory(self):
+        """Missing db/ is normal when the backup profile has no databases."""
+        self.configure(databases=[])
+        result = self.run_backup("daily")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Backup completed successfully", result.stdout)
+        self.assertFalse((self.destination / "db").exists())
+        self.assertEqual(len(list((self.destination / "sys").glob("*.tar.gz"))), 1)
+
     def test_missing_source_is_fatal(self):
         self.configure(source=self.root / "does-not-exist")
         result = self.run_backup("daily")
