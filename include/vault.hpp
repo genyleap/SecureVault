@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <expected>
 #include <filesystem>
 #include <string>
@@ -19,7 +20,8 @@ Snapshot create(const fs::path& repository, const fs::path& source,
 Snapshot create_logical_dump(const fs::path& repository,
                              const fs::path& password_file,
                              const std::string& database,
-                             const fs::path& executable = {});
+                             const fs::path& executable = {},
+                             std::chrono::seconds timeout = std::chrono::hours{12});
 // A generation commits only after file, PostgreSQL and MariaDB snapshots
 // are complete; the returned encrypted snapshot is a manifest of their IDs.
 Snapshot create_generation(const fs::path& repository, const fs::path& source,

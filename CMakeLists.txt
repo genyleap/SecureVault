@@ -108,6 +108,13 @@ if(BUILD_TESTING AND UNIX)
         $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>)
     add_test(NAME securevault-vault COMMAND securevault-vault-tests)
 
+    add_executable(securevault-vault-cli-tests tests/vault_cli_tests.cpp)
+    target_compile_options(securevault-vault-cli-tests PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME securevault-vault-cli
+        COMMAND securevault-vault-cli-tests $<TARGET_FILE:securevault-vault>)
+    set_tests_properties(securevault-vault-cli PROPERTIES TIMEOUT 90)
+
     add_executable(securevault-vault-https-tests tests/vault_https_tests.cpp)
     target_link_libraries(securevault-vault-https-tests PRIVATE
         securevault_vault OpenSSL::SSL)

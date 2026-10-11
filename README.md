@@ -24,7 +24,9 @@ acceptance requirements.
 - Native **encrypted logical database exports** from `pg_dumpall` and
   `mariadb-dump` process stdout directly through C++ pipes into SVLT.
   **No plaintext SQL staging files.** A failing or stalled dump cannot
-  publish a successful snapshot. An isolated restore produces an SQL file,
+  publish a successful snapshot. Even after stdout reaches EOF, the
+  producer must exit before its deadline; otherwise SecureVault kills it
+  and refuses publication. An isolated restore produces an SQL file,
   never imports it automatically into a running database.
 - Optional independent **HTTPS transport using libcurl**, supporting
   conditional PUT with `If-None-Match: *`, TLS verification, no redirects,
@@ -171,6 +173,9 @@ that are symlinks. Download requires an empty destination name and refuses
 to publish a changed ciphertext or an incorrectly authenticated archive.
 The remote endpoint **must honor create-only semantics**; SecureVault
 cannot guarantee a third-party service implements HTTP preconditions.
+The isolated TLS integration tests specifically reject HTTP 412 on PUT,
+HTTP 403 on GET, and an otherwise authentic archive served under a different
+content-addressed SHA-256 snapshot ID.
 Retention, versioning and immutable storage must be configured at the
 provider. The uploader does not auto-delete or prune remote objects.
 
@@ -194,6 +199,13 @@ provider. The uploader does not auto-delete or prune remote objects.
 The C++23 tests cover real encrypted-file and SQL-stream round trips,
 wrong passwords, malicious/truncated data, wrong snapshot fingerprints,
 key-file safety, HTTP/TLS PUT/GET, lost connectivity and fail-closed
-publication. Keep a known-good backup system in service until every
+publication. The HTTP test fixture rejects create-only upload conflicts
+(HTTP 412), expired GET authorizations (HTTP 403), and valid ciphertext
+under an incorrect SHA-256 identity. The SQL producer regression test
+closes stdout but remains alive, confirming the coordinator enforces
+a deadline and kills the stalled process. A separate C++23 CLI integration
+test exercises the actual executable through init/create/list/verify/restore
+and rejects invalid arguments and restore-target overwrite attempts.
+Keep a known-good backup system in service until every
 production acceptance gate in [RELEASE-READINESS.md](RELEASE-READINESS.md)
 has been passed.

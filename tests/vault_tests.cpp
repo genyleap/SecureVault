@@ -1,6 +1,7 @@
 #include "vault.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -47,6 +48,13 @@ int main(int argc, char** argv) {
             ? "CREATE ROLE synthetic_role;\\n"
             : "CREATE DATABASE synthetic_mariadb;\\n");
         if (std::getenv("SV_TEST_DB_FAIL")) return 21;
+        if (std::getenv("SV_TEST_DB_EOF_STALL")) {
+            // Simulate a dumper that closes stdout but never exits. The
+            // streaming reader sees EOF; only bounded waitpid detects it.
+            std::cout.flush();
+            close(STDOUT_FILENO);
+            sleep(3);
+        }
         return 0;
     }
     Tmp tmp;
@@ -217,6 +225,14 @@ int main(int argc, char** argv) {
     check(!create_logical_dump(repo, pass, "postgresql", mock_pg),
           "Failed SQL producer cannot publish an encrypted snapshot");
     unsetenv("SV_TEST_DB_FAIL");
+    setenv("SV_TEST_DB_EOF_STALL", "1", 1);
+    const auto start_stall = std::chrono::steady_clock::now();
+    const auto hung = create_logical_dump(repo, pass, "postgresql",
+                                         mock_pg, std::chrono::seconds{1});
+    const auto elapsed = std::chrono::steady_clock::now() - start_stall;
+    check(!hung && elapsed < std::chrono::seconds{3},
+          "Dumper that closes stdout but never exits is forcibly timed out");
+    unsetenv("SV_TEST_DB_EOF_STALL");
     const auto after_failure = list(repo);
     check(before_failure && after_failure &&
           before_failure->size() == after_failure->size(),

@@ -567,10 +567,14 @@ Snapshot create(const fs::path& repository, const fs::path& source,
 Snapshot create_logical_dump(const fs::path& repository,
                              const fs::path& password_file,
                              const std::string& database,
-                             const fs::path& executable) {
+                             const fs::path& executable,
+                             std::chrono::seconds timeout) {
     return guarded([&]() -> Snapshot {
         if (!valid_repo(repository))
             fail("Logical dump requires an existing private Vault repository");
+        if (timeout <= std::chrono::seconds::zero() ||
+            timeout > std::chrono::hours{24})
+            fail("Invalid bounded database dump deadline");
         std::error_code ec;
         const auto real_repo = fs::weakly_canonical(repository, ec);
         if (ec) fail("Cannot inspect logical backup repository");
@@ -635,17 +639,24 @@ Snapshot create_logical_dump(const fs::path& repository,
                     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
                 }
             }
-            void finish() {
+            void finish(std::chrono::steady_clock::time_point deadline) {
                 const int read_fd = std::exchange(pipe.value, -1);
-                // The read end is no longer required; it cannot be leaked.
                 if (read_fd >= 0) close(read_fd);
                 int status = 0;
-                pid_t result;
-                do { result = waitpid(pid, &status, 0); }
-                while (result < 0 && errno == EINTR);
-                if (result == pid) reaped = true;
-                if (result != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
-                    fail("Database dump exited unsuccessfully; no snapshot published");
+                for (;;) {
+                    const pid_t result = waitpid(pid, &status, WNOHANG);
+                    if (result == pid) {
+                        reaped = true;
+                        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+                            fail("Database dump exited unsuccessfully; no snapshot published");
+                        return;
+                    }
+                    if (result < 0 && errno != EINTR)
+                        fail("Cannot reap database producer; no snapshot published");
+                    if (std::chrono::steady_clock::now() >= deadline)
+                        fail("Database producer failed to exit before deadline");
+                    poll(nullptr, 0, 25);
+                }
             }
         } producer(pid, ends[0]);
         TempFile stage(repository, ".securevault-db-");
@@ -657,11 +668,12 @@ Snapshot create_logical_dump(const fs::path& repository,
         enc_raw(writer, filename);
         std::array<unsigned char, 65536> buf{};
         const auto start = std::chrono::steady_clock::now();
+        const auto deadline = start + timeout;
         auto last_progress = start;
         std::uint64_t produced = 0;
         while (true) {
             const auto now = std::chrono::steady_clock::now();
-            if (now - start > std::chrono::hours(12) ||
+            if (now >= deadline ||
                 now - last_progress > std::chrono::minutes(2))
                 fail("Database dump stalled or exceeded the time limit");
             pollfd waiting{producer.pipe.value, static_cast<short>(POLLIN | POLLHUP), 0};
@@ -682,7 +694,7 @@ Snapshot create_logical_dump(const fs::path& repository,
         enc_num<std::uint32_t>(writer, 0);
         writer.push(std::array<unsigned char, 1>{0});
         writer.done();
-        producer.finish();
+        producer.finish(deadline);
         const auto fingerprint = ciphertext_digest(stage.name);
         if (!fingerprint) fail(fingerprint.error());
         const auto dest = repository / (*fingerprint + ".svlt");

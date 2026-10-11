@@ -95,7 +95,7 @@ void send_all(SSL* connection, const std::string& bytes) {
         sent += static_cast<std::size_t>(n);
     }
 }
-enum class Mode { Upload, Download };
+enum class Mode { Upload, Download, RejectUpload, RejectDownload };
 void serve_once(int listener, SSL_CTX* context, Mode mode,
                 const fs::path& captured, const std::string& body) {
     const int client = accept(listener, nullptr, nullptr);
@@ -117,7 +117,7 @@ void serve_once(int listener, SSL_CTX* context, Mode mode,
     }
     const auto index = request.find(boundary);
     const auto headers = request.substr(0, index);
-    if (mode == Mode::Upload) {
+    if (mode == Mode::Upload || mode == Mode::RejectUpload) {
         require(headers.starts_with("PUT ") &&
                 headers.find("If-None-Match: *") != std::string::npos,
                 "Conditional PUT header missing");
@@ -135,13 +135,21 @@ void serve_once(int listener, SSL_CTX* context, Mode mode,
             received.append(buf.data(), n);
         }
         require(received.size() == length, "Unexpected extra HTTPS upload bytes");
-        put(captured, received);
-        send_all(ssl, "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        if (mode == Mode::RejectUpload)
+            send_all(ssl, "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        else {
+            put(captured, received);
+            send_all(ssl, "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
     } else {
         require(headers.starts_with("GET "), "Expected a TLS GET request");
-        send_all(ssl, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: " +
-                  std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n");
-        send_all(ssl, body);
+        if (mode == Mode::RejectDownload)
+            send_all(ssl, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        else {
+            send_all(ssl, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: " +
+                      std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n");
+            send_all(ssl, body);
+        }
     }
     SSL_free(ssl);
     close(client);
@@ -219,6 +227,16 @@ int main() {
         require(get(tmp.path / "received") == get(*snapshot),
                 "Uploaded encrypted ciphertext differs from native archive");
 
+        // Object storage must reject conditional overwrites. A 412 must
+        // never be reported as a successful off-site backup.
+        Loopback conflict_server(context, Mode::RejectUpload, tmp.path / "must-not-exist");
+        put(url_file, "https://localhost:" + std::to_string(conflict_server.port) + "/existing\n", true);
+        const auto conflict = securevault::vault::upload_https(
+            *snapshot, password, url_file, cert);
+        require(!conflict && !fs::exists(tmp.path / "must-not-exist"),
+                "Precondition-failed HTTP 412 must reject an upload");
+        require(conflict_server.finish(), "TLS 412 response fixture failed");
+
         const auto original = get(*snapshot);
         const auto replica_repo = tmp.path / "replica-repository";
         require(securevault::vault::initialize(replica_repo).has_value(),
@@ -240,6 +258,29 @@ int main() {
         require(get(target / "example.txt") ==
                 "TEST-SENSITIVE-HTTPS-ROUNDTRIP-4589235\n",
                 "Restored encrypted HTTPS payload mismatch");
+
+        // Expired or forbidden pre-signed GET URLs cannot publish anything.
+        Loopback forbidden_server(context, Mode::RejectDownload, tmp.path / "unused");
+        put(url_file, "https://localhost:" + std::to_string(forbidden_server.port) + "/expired\n", true);
+        const auto forbidden_repo = tmp.path / "forbidden-repository";
+        require(securevault::vault::initialize(forbidden_repo).has_value(),
+                "Cannot prepare private expired-token recipient");
+        const auto forbidden = securevault::vault::download_https(
+            forbidden_repo, object_id, password, url_file, cert);
+        require(!forbidden && !fs::exists(forbidden_repo / (object_id + ".svlt")),
+                "HTTP 403 cannot publish a remote snapshot");
+        require(forbidden_server.finish(), "TLS 403 response fixture failed");
+
+        // Even a perfectly valid, authenticated SVLT archive must match
+        // the particular SHA-256 content ID the caller requested.
+        Loopback identity_server(context, Mode::Download, tmp.path / "unused", original);
+        put(url_file, "https://localhost:" + std::to_string(identity_server.port) + "/wrong-object\n", true);
+        const auto mismatched_id = std::string(64, 'f');
+        const auto mismatch = securevault::vault::download_https(
+            forbidden_repo, mismatched_id, password, url_file, cert);
+        require(!mismatch && !fs::exists(forbidden_repo / (mismatched_id + ".svlt")),
+                "Authenticated but wrong ciphertext identity must fail closed");
+        require(identity_server.finish(), "TLS wrong-identity fixture failed");
 
         auto tampered = original;
         tampered[100] ^= 0x20;

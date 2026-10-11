@@ -11,8 +11,10 @@ is not equivalent to proof of business continuity.
   authentication before publishing recovered files
 - Content-addressed ciphertext SHA-256 IDs and strict recovery identity
 - Streamed PostgreSQL/MariaDB logical dump adapter with producer exit
-  validation and failure rollback; SQL not written to temporary plaintext
-  files by the adapter
+  validation, bounded EOF-to-exit wait, deadline enforcement and failure
+  rollback; SQL not written to temporary plaintext files by the adapter.
+  A C++ fixture explicitly closes stdout but remains alive to verify the
+  native coordinator terminates the stalled producer.
 - Native encrypted generation commit marker after successful file,
   PostgreSQL and MariaDB snapshots; exact content-addressed component
   identities and GCM authentication checked during generation verification
@@ -20,7 +22,10 @@ is not equivalent to proof of business continuity.
   verification, no redirect, 0600 URL files and fail-closed publication;
   uploaded bytes are SHA-256-checked as they stream from the source
 - Real localhost TLS server fixture built with OpenSSL, with encryption
-  roundtrip, received object equality and tampering refusal
+  roundtrip, received object equality and tampering refusal; rejected
+  uploads (HTTP 412), expired download authorization (HTTP 403), and a
+  valid authenticated archive served under the wrong SHA-256 ID are all
+  rejected without publishing a snapshot.
 - Local filesystem tests covering symlinks, hardlinks, path traversal,
   corrupt and truncated archives, duplicate destinations, and key safety
 
