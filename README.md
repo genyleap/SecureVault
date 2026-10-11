@@ -111,6 +111,36 @@ inside a newly created restore directory. They do not directly restore a
 database, capture a transactionally consistent checkpoint across engines,
 or provide physical PostgreSQL WAL/MariaDB binlog PITR.
 
+## Native encrypted backup generations (experimental)
+
+Create one logical generation consisting of an encrypted file snapshot,
+PostgreSQL dump and MariaDB dump. A **fourth, encrypted commit snapshot**
+(`manifest.svgen`) is written only when all three components succeed.
+Its content identifies each component's 64-character SHA-256 snapshot ID.
+The verifier authenticates the marker, checks the referenced ciphertext
+fingerprints and individually verifies all three GCM tags.
+
+```bash
+securevault-vault generation-create \
+  --repo /absolute/private/vault \
+  --source /absolute/test-data \
+  --password-file /absolute/secret/keyfile
+
+securevault-vault generation-verify \
+  --repo /absolute/private/vault \
+  --snapshot /absolute/private/vault/MANIFEST_SHA256.svlt \
+  --password-file /absolute/secret/keyfile
+```
+
+If a stage fails, the commit marker is **not written**. Earlier component
+snapshots may remain as *uncommitted encrypted snapshots* and are never
+silently treated as a successful generation. There is no automatic deletion
+of these or other backups. This is a **local** multi-component commit marker,
+not an atomic cross-database transaction or an off-site completion receipt.
+The operator must independently replicate and test-recover the four encrypted
+objects. Physical base backups, WAL/binlog PITR and cross-database consistency
+remain out of scope for this implementation.
+
 ## HTTPS off-site transport (experimental)
 
 Provision a service that accepts **single-object HTTPS PUT with the

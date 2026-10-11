@@ -10,6 +10,7 @@
 #include <fstream>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -565,7 +566,8 @@ Snapshot create(const fs::path& repository, const fs::path& source,
 }
 Snapshot create_logical_dump(const fs::path& repository,
                              const fs::path& password_file,
-                             const std::string& database) {
+                             const std::string& database,
+                             const fs::path& executable) {
     return guarded([&]() -> Snapshot {
         if (!valid_repo(repository))
             fail("Logical dump requires an existing private Vault repository");
@@ -587,6 +589,13 @@ Snapshot create_logical_dump(const fs::path& repository,
             filename = "mariadb-all.sql";
         } else {
             fail("Only PostgreSQL and MariaDB logical backups are supported");
+        }
+        // Integration tests pass an explicit absolute fixture executable.
+        // No environment/PATH override is used to resolve a mock dumper.
+        if (!executable.empty()) {
+            if (!executable.is_absolute() || !fs::exists(executable))
+                fail("Explicit database executable must be an existing absolute path");
+            arguments[0] = executable.string();
         }
         int ends[2] = {-1, -1};
         if (pipe(ends) != 0) fail("Cannot create encrypted database stream");
@@ -681,6 +690,104 @@ Snapshot create_logical_dump(const fs::path& repository,
         stage.name.clear();
         sync_parent(repository);
         return dest;
+    });
+}
+// The generation marker is itself an authenticated SVLT snapshot. Its
+// plaintext contains only component IDs, never exported database records.
+Snapshot create_generation(const fs::path& repository, const fs::path& source,
+                           const fs::path& password_file,
+                           const fs::path& pg_executable,
+                           const fs::path& mariadb_executable) {
+    return guarded([&]() -> Snapshot {
+        if (!valid_repo(repository))
+            fail("Native generation requires an existing private repository");
+        const auto files = create(repository, source, password_file);
+        if (!files) fail("File generation component failed: " + files.error());
+        const auto postgres = create_logical_dump(
+            repository, password_file, "postgresql", pg_executable);
+        if (!postgres) fail("PostgreSQL generation component failed: " +
+                            postgres.error());
+        const auto mariadb = create_logical_dump(
+            repository, password_file, "mariadb", mariadb_executable);
+        if (!mariadb) fail("MariaDB generation component failed: " +
+                          mariadb.error());
+
+        const auto valid_id = [](const fs::path& file) {
+            const std::string id = file.stem().string();
+            return id.size() == 64 && std::all_of(
+                id.begin(), id.end(), [](unsigned char c) {
+                    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                });
+        };
+        if (!valid_id(*files) || !valid_id(*postgres) || !valid_id(*mariadb))
+            fail("Generation cannot commit non-content-addressed snapshots");
+        TempDir temp(fs::temp_directory_path());
+        const auto marker_file = temp.name / "manifest.svgen";
+        Fd fd(open(marker_file.c_str(),
+                   O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0600));
+        if (fd.value < 0) fail("Cannot allocate private generation manifest");
+        const std::string record = "SVGEN02\n" + files->stem().string() + "\n" +
+            postgres->stem().string() + "\n" + mariadb->stem().string() + "\n";
+        write_all(fd.value, std::span(
+            reinterpret_cast<const unsigned char*>(record.data()), record.size()));
+        if (fsync(fd.value) != 0) fail("Cannot flush generation manifest");
+        const auto committed = create(repository, marker_file, password_file);
+        if (!committed) fail("Cannot encrypt generation commit marker: " +
+                              committed.error());
+        return *committed;
+    });
+}
+Status verify_generation(const fs::path& repository,
+                         const fs::path& manifest_snapshot,
+                         const fs::path& password_file) {
+    return guarded([&]() -> Status {
+        if (!valid_repo(repository))
+            fail("Generation validation requires a private repository");
+        std::error_code ec;
+        const auto real_repo = fs::weakly_canonical(repository, ec);
+        if (ec) fail("Cannot resolve native generation repository");
+        const auto real_marker = fs::weakly_canonical(manifest_snapshot, ec);
+        if (ec || real_marker.parent_path() != real_repo)
+            fail("Generation marker must reside in the specified repository");
+        const auto marker_digest = ciphertext_digest(manifest_snapshot);
+        if (!marker_digest ||
+            manifest_snapshot.filename().string() != *marker_digest + ".svlt")
+            fail("Generation marker has an invalid content address");
+        TempDir scratch(fs::temp_directory_path());
+        const auto unpack = scratch.name / "validated";
+        const auto extracted = restore(manifest_snapshot, unpack, password_file);
+        if (!extracted) fail("Cannot authenticate generation manifest: " +
+                             extracted.error());
+        const auto file = unpack / "manifest.svgen";
+        const auto stat = fs::symlink_status(file, ec);
+        if (ec || !fs::is_regular_file(stat) || fs::file_size(file, ec) > 512 || ec)
+            fail("Generation manifest must be a short regular file");
+        std::ifstream stream(file, std::ios::binary);
+        if (!stream) fail("Cannot inspect decrypted generation marker");
+        std::string header, files, postgres, mariadb, extra;
+        if (!std::getline(stream, header) || !std::getline(stream, files) ||
+            !std::getline(stream, postgres) || !std::getline(stream, mariadb) ||
+            std::getline(stream, extra) || header != "SVGEN02")
+            fail("Invalid native generation manifest structure");
+        auto safe_id = [](const std::string& id) {
+            return id.size() == 64 && std::all_of(
+                id.begin(), id.end(), [](unsigned char c) {
+                    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                });
+        };
+        if (!safe_id(files) || !safe_id(postgres) || !safe_id(mariadb) ||
+            files == postgres || files == mariadb || postgres == mariadb)
+            fail("Missing, duplicate or malformed generation snapshot identities");
+        for (const auto& id : {files, postgres, mariadb}) {
+            const auto member = repository / (id + ".svlt");
+            const auto hash = ciphertext_digest(member);
+            if (!hash || *hash != id)
+                fail("Required generation component is missing or modified");
+            const auto valid = verify(member, password_file);
+            if (!valid)
+                fail("Generation component failed AES-GCM authentication");
+        }
+        return {};
     });
 }
 Status verify(const fs::path& archive, const fs::path& password_file) {

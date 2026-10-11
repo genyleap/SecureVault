@@ -1,5 +1,6 @@
 #include "vault.hpp"
 #include <curl/curl.h>
+#include <openssl/evp.h>
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -57,6 +58,7 @@ std::string private_url(const fs::path& path) {
     }
     if (!url.empty() && url.back() == '\n') url.pop_back();
     require(!url.empty() && url.starts_with("https://") &&
+            url.find('\0') == std::string::npos &&
             url.find_first_of("\r\n\t <>") == std::string::npos,
             "Only a single HTTPS URL without whitespace is supported");
     // Deliberately reject embedded user:pass credentials; signed query URLs
@@ -129,15 +131,27 @@ void no_replace(const fs::path& from, const fs::path& to) {
     fail("Atomic no-replace publication unsupported on this platform");
 #endif
 }
+struct ReadState {
+    int fd;
+    EVP_MD_CTX* digest;
+    std::uint64_t total = 0;
+};
 std::size_t read_callback(char* out, std::size_t size, std::size_t n,
                           void* data) {
     if (size && n > SIZE_MAX / size) return CURL_READFUNC_ABORT;
     const auto count = size * n;
     if (count == 0) return 0;
-    const auto fd = *static_cast<int*>(data);
-    const ssize_t result = read(fd, out, count);
-    if (result < 0) return CURL_READFUNC_ABORT;
-    return static_cast<std::size_t>(result);
+    auto& source = *static_cast<ReadState*>(data);
+    ssize_t received;
+    do { received = read(source.fd, out, count); }
+    while (received < 0 && errno == EINTR);
+    if (received < 0) return CURL_READFUNC_ABORT;
+    if (received > 0) {
+        if (EVP_DigestUpdate(source.digest, out, received) != 1)
+            return CURL_READFUNC_ABORT;
+        source.total += static_cast<std::uint64_t>(received);
+    }
+    return static_cast<std::size_t>(received);
 }
 struct WriteState {
     int fd;
@@ -199,14 +213,40 @@ Status upload_https(const fs::path& archive, const fs::path& password_file,
         require(raw != nullptr, "Cannot disable HTTP Expect handshake");
         headers.release();
         headers.reset(raw);
+        // Fingerprint the exact byte stream handed to curl, not only a
+        // preflight copy of the file. Detect truncation and concurrent edits.
+        using Digest = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+        Digest digest(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+        require(digest && EVP_DigestInit_ex(digest.get(), EVP_sha256(), nullptr) == 1,
+                "Cannot initialize encrypted upload stream fingerprint");
+        ReadState stream{input.fd, digest.get()};
         curl_easy_setopt(easy.get(), CURLOPT_HTTPHEADER, headers.get());
         curl_easy_setopt(easy.get(), CURLOPT_UPLOAD, 1L);
         curl_easy_setopt(easy.get(), CURLOPT_READFUNCTION, read_callback);
-        curl_easy_setopt(easy.get(), CURLOPT_READDATA, &input.fd);
-        curl_easy_setopt(easy.get(), CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(st.st_size));
+        curl_easy_setopt(easy.get(), CURLOPT_READDATA, &stream);
+        curl_easy_setopt(easy.get(), CURLOPT_INFILESIZE_LARGE,
+                         static_cast<curl_off_t>(st.st_size));
         curl_easy_setopt(easy.get(), CURLOPT_WRITEFUNCTION, discard_callback);
         const auto result = curl_easy_perform(easy.get());
         check_response(easy.get(), result, true);
+        struct stat after{};
+        require(fstat(input.fd, &after) == 0 &&
+                after.st_dev == st.st_dev && after.st_ino == st.st_ino &&
+                after.st_size == st.st_size &&
+                stream.total == static_cast<std::uint64_t>(st.st_size),
+                "Encrypted upload source changed or ended prematurely");
+        std::array<unsigned char, 32> checksum{};
+        unsigned int count = 0;
+        require(EVP_DigestFinal_ex(digest.get(), checksum.data(), &count) == 1 &&
+                count == checksum.size(), "Cannot finalize encrypted upload fingerprint");
+        constexpr char hex[] = "0123456789abcdef";
+        std::string streamed_id;
+        streamed_id.reserve(64);
+        for (auto byte : checksum) {
+            streamed_id.push_back(hex[byte >> 4]);
+            streamed_id.push_back(hex[byte & 15]);
+        }
+        require(streamed_id == *hash, "Encrypted upload bytes changed during transfer");
         return {};
     });
 }

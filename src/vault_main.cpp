@@ -10,6 +10,8 @@ int main(int argc, char** argv) {
         {"init", {"--repo"}},
         {"create", {"--repo", "--source", "--password-file"}},
         {"database-backup", {"--repo", "--database", "--password-file"}},
+        {"generation-create", {"--repo", "--source", "--password-file"}},
+        {"generation-verify", {"--repo", "--snapshot", "--password-file"}},
         {"restore", {"--snapshot", "--target", "--password-file"}},
         {"verify", {"--snapshot", "--password-file"}},
         {"list", {"--repo"}},
@@ -58,6 +60,16 @@ int main(int argc, char** argv) {
             get("--repo"), get("--password-file"), get("--database"));
         if (!result) { std::cerr << result.error() << '\n'; return 1; }
         std::cout << result->string() << '\n';
+    } else if (action == "generation-create") {
+        auto result = securevault::vault::create_generation(
+            get("--repo"), get("--source"), get("--password-file"));
+        if (!result) { std::cerr << result.error() << '\n'; return 1; }
+        std::cout << result->string() << '\n';
+    } else if (action == "generation-verify") {
+        auto result = securevault::vault::verify_generation(
+            get("--repo"), get("--snapshot"), get("--password-file"));
+        if (!result) { std::cerr << result.error() << '\n'; return 1; }
+        std::cout << "Native generation components authenticated\n";
     } else if (action == "restore") {
         auto result = securevault::vault::restore(
             get("--snapshot"), get("--target"), get("--password-file"));

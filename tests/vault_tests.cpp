@@ -1,4 +1,5 @@
 #include "vault.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <filesystem>
@@ -172,6 +173,11 @@ int main(int argc, char** argv) {
     check(!upload_https(*archive, pass, bad_url),
           "Rejects insecure URL credentials file permissions");
     chmod(bad_url.c_str(), 0600);
+    write(bad_url, std::string("https://storage.example.test/object") +
+                   std::string(1, '\0') + "unexpected");
+    check(!upload_https(*archive, pass, bad_url),
+          "Embedded NUL in signed URL file is refused");
+    write(bad_url, "https://127.0.0.1:1/offsite/snapshot.svlt\n");
     fs::create_symlink(bad_url, tmp.path / "url-symlink");
     check(!upload_https(*archive, pass, tmp.path / "url-symlink"),
           "Rejects URL file symlinks");
@@ -190,16 +196,15 @@ int main(int argc, char** argv) {
     const auto self = fs::canonical(argv[0]);
     fs::create_symlink(self, mockbin / "pg_dumpall");
     fs::create_symlink(self, mockbin / "mariadb-dump");
-    const std::string old_path = std::getenv("PATH") ? std::getenv("PATH") : "";
-    const std::string mock_path = mockbin.string() + ":" + old_path;
-    setenv("PATH", mock_path.c_str(), 1);
-    auto pg = create_logical_dump(repo, pass, "postgresql");
+    const auto mock_pg = mockbin / "pg_dumpall";
+    const auto mock_maria = mockbin / "mariadb-dump";
+    auto pg = create_logical_dump(repo, pass, "postgresql", mock_pg);
     check(pg && verify(*pg, pass), "PostgreSQL logical stdout encrypted directly");
     const auto pg_dest = tmp.path / "pg-restored";
     check(pg && restore(*pg, pg_dest, pass) &&
           read(pg_dest / "postgresql-all.sql").find("synthetic_role") != std::string::npos,
           "PostgreSQL logical export restores from authenticated ciphertext");
-    auto maria = create_logical_dump(repo, pass, "mariadb");
+    auto maria = create_logical_dump(repo, pass, "mariadb", mock_maria);
     check(maria && verify(*maria, pass), "MariaDB logical stdout encrypted directly");
     const auto maria_dest = tmp.path / "maria-restored";
     check(maria && restore(*maria, maria_dest, pass) &&
@@ -209,14 +214,59 @@ int main(int argc, char** argv) {
           "Unexpected database engines are refused");
     const auto before_failure = list(repo);
     setenv("SV_TEST_DB_FAIL", "1", 1);
-    check(!create_logical_dump(repo, pass, "postgresql"),
+    check(!create_logical_dump(repo, pass, "postgresql", mock_pg),
           "Failed SQL producer cannot publish an encrypted snapshot");
     unsetenv("SV_TEST_DB_FAIL");
     const auto after_failure = list(repo);
     check(before_failure && after_failure &&
           before_failure->size() == after_failure->size(),
           "Failed database producer leaves snapshot inventory unchanged");
-    setenv("PATH", old_path.c_str(), 1);
+
+    // A generation is committed only after all three native components
+    // succeed. The manifest is itself an encrypted, content-addressed SVLT.
+    const auto before_generation = list(repo);
+    const auto manifest = create_generation(
+        repo, source, pass, mock_pg, mock_maria);
+    check(manifest && fs::is_regular_file(*manifest),
+          "Generation writes an encrypted marker only after all components complete");
+    const auto checked_generation = manifest
+        ? verify_generation(repo, *manifest, pass) : Status(std::unexpected("No marker"));
+    if (!checked_generation)
+        std::cerr << "Generation verification error: " << checked_generation.error() << '\n';
+    check(checked_generation.has_value(),
+          "Generation verifies three authenticated content-addressed snapshots");
+    check(manifest && !verify_generation(repo, *manifest, wrong),
+          "Wrong password cannot certify a committed generation");
+    const auto committed_inventory = list(repo);
+
+    const auto inventory_before_failure = list(repo);
+    setenv("SV_TEST_DB_FAIL", "1", 1);
+    check(!create_generation(repo, source, pass, mock_pg, mock_maria),
+          "An interrupted component cannot create a generation commit");
+    unsetenv("SV_TEST_DB_FAIL");
+    check(manifest && verify_generation(repo, *manifest, pass),
+          "Failed new generation does not invalidate the prior committed one");
+    const auto inventory_after_failure = list(repo);
+    check(inventory_before_failure && inventory_after_failure &&
+          inventory_after_failure->size() == inventory_before_failure->size() + 1,
+          "An incomplete generation leaves an uncommitted encrypted file snapshot");
+
+    fs::path component_to_remove;
+    if (manifest && before_generation && committed_inventory) {
+        for (const auto& entry : *committed_inventory) {
+            if (entry != *manifest &&
+                std::find(before_generation->begin(), before_generation->end(), entry)
+                    == before_generation->end()) {
+                component_to_remove = entry;
+                break;
+            }
+        }
+    }
+    if (!component_to_remove.empty()) fs::remove(component_to_remove);
+    check(manifest && !component_to_remove.empty() &&
+          !verify_generation(repo, *manifest, pass),
+          "Missing or deleted generation component invalidates the commit");
+
     std::cout << "SecureVault C++23 vault: " << cases - failures
               << "/" << cases << " checks passed\n";
     return failures ? 1 : 0;

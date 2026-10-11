@@ -18,7 +18,17 @@ Snapshot create(const fs::path& repository, const fs::path& source,
 // no intermediate plaintext SQL file and no Restic execution.
 Snapshot create_logical_dump(const fs::path& repository,
                              const fs::path& password_file,
-                             const std::string& database);
+                             const std::string& database,
+                             const fs::path& executable = {});
+// A generation commits only after file, PostgreSQL and MariaDB snapshots
+// are complete; the returned encrypted snapshot is a manifest of their IDs.
+Snapshot create_generation(const fs::path& repository, const fs::path& source,
+                           const fs::path& password_file,
+                           const fs::path& pg_executable = {},
+                           const fs::path& mariadb_executable = {});
+Status verify_generation(const fs::path& repository,
+                         const fs::path& manifest_snapshot,
+                         const fs::path& password_file);
 Status verify(const fs::path& archive, const fs::path& password_file);
 Status restore(const fs::path& archive, const fs::path& target,
                const fs::path& password_file);

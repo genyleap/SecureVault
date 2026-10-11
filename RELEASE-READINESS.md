@@ -13,14 +13,26 @@ is not equivalent to proof of business continuity.
 - Streamed PostgreSQL/MariaDB logical dump adapter with producer exit
   validation and failure rollback; SQL not written to temporary plaintext
   files by the adapter
+- Native encrypted generation commit marker after successful file,
+  PostgreSQL and MariaDB snapshots; exact content-addressed component
+  identities and GCM authentication checked during generation verification
 - HTTPS conditional PUT and GET using libcurl with TLS certificate
-  verification, no redirect, 0600 URL files and fail-closed publication
+  verification, no redirect, 0600 URL files and fail-closed publication;
+  uploaded bytes are SHA-256-checked as they stream from the source
 - Real localhost TLS server fixture built with OpenSSL, with encryption
   roundtrip, received object equality and tampering refusal
 - Local filesystem tests covering symlinks, hardlinks, path traversal,
   corrupt and truncated archives, duplicate destinations, and key safety
 
 ## Remaining gates before a production release
+
+**Sanitizer caveat:** The experimental GCC AddressSanitizer/UBSan run was
+interrupted after a database-dump test subprocess failed to exit promptly.
+It is **not a passing sanitizer report**. The test harness was changed to
+use an explicit absolute path for its C++ mock executables rather than PATH
+search, and ordinary GCC builds/tests have been revalidated. Repeat the
+instrumented test run only in an isolated worker with explicit subprocess
+cleanup and no production database access.
 
 1. **Platform acceptance:** build and test the exact branch on a target
    macOS version and production Linux distribution/architecture. Use
