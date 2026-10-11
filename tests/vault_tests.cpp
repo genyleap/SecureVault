@@ -87,6 +87,16 @@ int main(int argc, char** argv) {
     const auto digest = ciphertext_digest(*archive);
     check(digest && archive->filename().string() == *digest + ".svlt",
           "New archive IDs are SHA-256 of authenticated ciphertext");
+    const auto link_to_archive = tmp.path / "snapshot-symlink.svlt";
+    fs::create_symlink(*archive, link_to_archive);
+    check(!ciphertext_digest(link_to_archive),
+          "Snapshot digest rejects a symbolic-link input");
+    fs::remove(link_to_archive);
+    const auto hardlinked_archive = tmp.path / "snapshot-hardlink.svlt";
+    fs::create_hard_link(*archive, hardlinked_archive);
+    check(!ciphertext_digest(*archive) && !ciphertext_digest(hardlinked_archive),
+          "Snapshot digest refuses hardlinked ciphertext");
+    fs::remove(hardlinked_archive);
     check(verify(*archive, pass).has_value(), "Authenticates the complete snapshot");
     check(!verify(*archive, wrong), "Rejects a wrong password");
     auto inventory = list(repo);

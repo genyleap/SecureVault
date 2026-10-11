@@ -471,6 +471,22 @@ bool valid_repo(const fs::path& root) {
            !fs::is_symlink(st) &&
            (static_cast<unsigned>(st.permissions()) & 077) == 0;
 }
+bool same_file_revision(const struct stat& before, const struct stat& after) {
+    if (before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+        before.st_size != after.st_size || before.st_nlink != after.st_nlink)
+        return false;
+#ifdef __APPLE__
+    return before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec &&
+           before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec &&
+           before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec &&
+           before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec;
+#else
+    return before.st_mtim.tv_sec == after.st_mtim.tv_sec &&
+           before.st_mtim.tv_nsec == after.st_mtim.tv_nsec &&
+           before.st_ctim.tv_sec == after.st_ctim.tv_sec &&
+           before.st_ctim.tv_nsec == after.st_ctim.tv_nsec;
+#endif
+}
 template <typename F> auto guarded(F&& fn) {
     using Return = decltype(fn());
     try { return fn(); }
@@ -484,22 +500,31 @@ std::expected<std::string, std::string> ciphertext_digest(const fs::path& archiv
         if (file.value < 0) fail("Cannot open encrypted snapshot for fingerprint");
         struct stat st{};
         if (fstat(file.value, &st) != 0 || !S_ISREG(st.st_mode) ||
-            st.st_nlink != 1 || st.st_size < 52)
-            fail("Snapshot fingerprint requires a regular, non-hardlinked archive");
+            st.st_nlink != 1 || st.st_size < 52 ||
+            static_cast<std::uint64_t>(st.st_size) > max_bytes + 52)
+            fail("Snapshot fingerprint requires a bounded regular archive");
         using Digest = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
         Digest context(EVP_MD_CTX_new(), EVP_MD_CTX_free);
         if (!context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1)
             fail("SHA-256 digest initialization failed");
         std::array<unsigned char, 65536> bytes{};
+        std::uint64_t total_read = 0;
         while (true) {
             const ssize_t n = read(file.value, bytes.data(), bytes.size());
             if (n < 0 && errno == EINTR) continue;
             if (n < 0) fail("Cannot read snapshot fingerprint");
             if (n == 0) break;
-            if (EVP_DigestUpdate(context.get(), bytes.data(),
+            total_read += static_cast<std::uint64_t>(n);
+            if (total_read > static_cast<std::uint64_t>(st.st_size) ||
+                EVP_DigestUpdate(context.get(), bytes.data(),
                                  static_cast<std::size_t>(n)) != 1)
-                fail("SHA-256 digest failed");
+                fail("SHA-256 digest failed or file length changed");
         }
+        struct stat after{};
+        if (fstat(file.value, &after) != 0 ||
+            !same_file_revision(st, after) ||
+            total_read != static_cast<std::uint64_t>(st.st_size))
+            fail("Encrypted snapshot changed while hashing");
         std::array<unsigned char, 32> checksum{};
         unsigned int actual = 0;
         if (EVP_DigestFinal_ex(context.get(), checksum.data(), &actual) != 1 ||
