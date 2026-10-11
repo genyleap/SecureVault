@@ -156,8 +156,14 @@ std::expected<void, std::string> checkpoint(const fs::path& dest, const Json::Va
         unlink(chars.data());
         return std::unexpected("Could not publish checkpoint");
     }
+    // A successful rename is not necessarily durable until its parent
+    // directory metadata has been flushed. Fail closed on sync errors.
     const int dirfd = open(dest.parent_path().c_str(), O_RDONLY);
-    if (dirfd >= 0) { fsync(dirfd); close(dirfd); }
+    if (dirfd < 0) return std::unexpected("Cannot open checkpoint directory for durability sync");
+    const bool directory_flushed = fsync(dirfd) == 0;
+    const bool directory_closed = close(dirfd) == 0;
+    if (!directory_flushed || !directory_closed)
+        return std::unexpected("Checkpoint directory sync failed");
     return {};
 #else
     return std::unexpected("MariaDB binlog shipping requires POSIX");
@@ -193,6 +199,13 @@ Result binlog_ship(const fs::path& config_path, bool perform) {
     if (!private_default) return std::unexpected("MariaDB defaults file must be private");
     Lock lock(state_path.string() + ".lock");
     if (lock.fd < 0) return std::unexpected("Cannot acquire exclusive shipping lock");
+    // Reject symlinks even when dangling (fs::exists follows them).
+    const auto checkpoint_status = fs::symlink_status(state_path, ec);
+    if (!ec && fs::is_symlink(checkpoint_status))
+        return std::unexpected("Checkpoint state symlink is forbidden");
+    if (ec && ec != std::errc::no_such_file_or_directory)
+        return std::unexpected("Cannot inspect shipping checkpoint");
+    ec.clear();
     Json::Value state;
     if (fs::exists(state_path, ec)) {
         auto secure = private_file(state_path);

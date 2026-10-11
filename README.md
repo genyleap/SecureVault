@@ -78,6 +78,13 @@ The `generations` command checks the presence of all three tagged snapshots
 (files, PostgreSQL, MariaDB), not cross-service transactional consistency.
 `check` reads repository data and may incur network/storage charges.
 
+Recovery is fail-closed: before a restored directory becomes visible at its
+destination, SecureVault rejects files with multiple hard links, FIFO/socket
+or device entries, absolute/escaping symlinks, and incomplete extractions.
+Safe relative symlinks remain supported. **Hardlinked regular files are
+deliberately not yet supported**, even if they originated from valid snapshots.
+The target directory must not already exist, including in a concurrent race.
+
 For a database SQL export use `--kind postgresql` or
 `--kind mariadb` and **explicitly** add `--allow-plaintext-export`.
 The command restores only into a new directory; it never imports SQL into

@@ -95,13 +95,31 @@ std::expected<void, std::string> safe_restored_tree(const fs::path& stage) {
     std::error_code ec;
     const auto root = fs::weakly_canonical(stage, ec);
     if (ec) return std::unexpected("Cannot determine extraction root");
-    for (fs::recursive_directory_iterator i(stage, fs::directory_options::none, ec), end;
-         i != end && !ec; i.increment(ec)) {
-        if (!fs::is_symlink(i->symlink_status(ec))) continue;
-        const auto target = fs::read_symlink(i->path(), ec);
-        if (ec || target.is_absolute()) return std::unexpected("Restored symlink has unsafe target");
-        auto resolved = (i->path().parent_path() / target).lexically_normal();
-        auto rel = resolved.lexically_relative(root);
+
+    // Do not follow directory symlinks. Restic restores metadata too, so
+    // reject devices, sockets, FIFOs, and hardlinks before publishing files.
+    fs::recursive_directory_iterator it(stage, fs::directory_options::none, ec);
+    if (ec) return std::unexpected("Cannot traverse recovered directory");
+    const fs::recursive_directory_iterator end;
+    for (; it != end; it.increment(ec)) {
+        if (ec) return std::unexpected("Cannot inspect entire recovered tree");
+        const auto status = it->symlink_status(ec);
+        if (ec) return std::unexpected("Cannot inspect restored entry metadata");
+        if (fs::is_regular_file(status)) {
+            const auto links = fs::hard_link_count(it->path(), ec);
+            if (ec || links != 1)
+                return std::unexpected("Hardlinked restored files are refused");
+            continue;
+        }
+        if (fs::is_directory(status)) continue;
+        if (!fs::is_symlink(status))
+            return std::unexpected("Special files in a restored snapshot are refused");
+
+        const auto target = fs::read_symlink(it->path(), ec);
+        if (ec || target.empty() || target.is_absolute())
+            return std::unexpected("Restored symlink has unsafe target");
+        const auto resolved = (it->path().parent_path() / target).lexically_normal();
+        const auto rel = resolved.lexically_relative(root);
         if (rel.empty() || rel == "." || (*rel.begin()) == "..")
             return std::unexpected("Restored symlink escapes recovery directory");
     }

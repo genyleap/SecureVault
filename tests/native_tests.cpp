@@ -56,15 +56,34 @@ int mocked(int argc, char** argv) {
             for (int i = 2; i + 1 < argc; ++i)
                 if (std::string_view(argv[i]) == "--target") target = argv[i + 1];
             if (target.empty()) return 42;
-            if (argv[2] == b) file(fs::path(target) / "postgresql-all.sql", "SELECT 1;\n");
-            else {
-                fs::create_directories(fs::path(target) / "var" / "www");
-                file(fs::path(target) / "var" / "www" / "index.txt", "restored contents\n");
+            if (argv[2] == b) {
+                file(fs::path(target) / "postgresql-all.sql", "SELECT 1;\n");
+                if (std::getenv("SV_MOCK_EXTRA_SQL"))
+                    file(fs::path(target) / "unexpected.sql", "SELECT 2;\n");
+            } else {
+                const auto dir = fs::path(target) / "var" / "www";
+                fs::create_directories(dir);
+                file(dir / "index.txt", "restored contents\n");
                 if (std::getenv("SV_MOCK_EVIL_SYMLINK"))
                     fs::create_symlink("/etc/passwd", fs::path(target) / "evil");
+                if (std::getenv("SV_MOCK_SAFE_SYMLINK"))
+                    fs::create_symlink("index.txt", dir / "safe-link");
+                if (std::getenv("SV_MOCK_SPECIAL_FIFO"))
+                    if (mkfifo((fs::path(target) / "unsafe-fifo").c_str(), 0600) != 0) return 44;
+                if (std::getenv("SV_MOCK_HARDLINK"))
+                    fs::create_hard_link(dir / "index.txt", dir / "hardlinked.txt");
             }
+            if (const char* raced = std::getenv("SV_MOCK_RACE_DEST")) {
+                fs::create_directory(raced);
+                file(fs::path(raced) / "sentinel", "must remain");
+            }
+            if (std::getenv("SV_MOCK_FAIL_RESTORE")) return 35;
         } else if (action == "backup") {
             if (std::getenv("SV_MOCK_UPLOAD_FAIL")) return 23;
+            if (std::getenv("SV_MOCK_BINLOG_MUTATE") && argc >= 3) {
+                std::ofstream changed(argv[argc - 1], std::ios::binary | std::ios::trunc);
+                changed << "FAIL"; // Same length, different content.
+            }
             std::cout << "{\"message_type\":\"summary\",\"snapshot_id\":\"" << a << "\"}\n";
         } else if (action == "check") {
             if (std::getenv("SV_MOCK_CHECK_FAIL")) return 23;
@@ -75,14 +94,17 @@ int mocked(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             const std::string argument = argv[i];
             if (argument == "SHOW BINARY LOGS") {
-                if (std::getenv("SV_MOCK_MORE_BINLOGS"))
+                if (std::getenv("SV_MOCK_GAP_BINLOGS"))
+                    std::cout << "mysql-bin.000001\t4\nmysql-bin.000003\t4\n";
+                else if (std::getenv("SV_MOCK_MORE_BINLOGS"))
                     std::cout << "mysql-bin.000001\t4\nmysql-bin.000002\t4\nmysql-bin.000003\t4\n";
                 else
                     std::cout << "mysql-bin.000001\t4\nmysql-bin.000002\t4\n";
                 return 0;
             }
             if (argument == "SHOW MASTER STATUS") {
-                std::cout << (std::getenv("SV_MOCK_MORE_BINLOGS") ?
+                std::cout << ((std::getenv("SV_MOCK_MORE_BINLOGS") ||
+                               std::getenv("SV_MOCK_GAP_BINLOGS")) ?
                               "mysql-bin.000003\t4\n" : "mysql-bin.000002\t4\n");
                 return 0;
             }
@@ -150,6 +172,51 @@ int main(int argc, char** argv) {
     check(!evil && !fs::exists(temp.dir / "evil-dest"), "Reject link escaping staging root");
     unsetenv("SV_MOCK_EVIL_SYMLINK");
 
+    setenv("SV_MOCK_SAFE_SYMLINK", "1", 1);
+    const auto safe_link_target = temp.dir / "safe-symlink-dest";
+    auto safe_link = restic_restore(std::string(64, 'a'), "files", safe_link_target, false);
+    check(safe_link && fs::is_symlink(safe_link_target / "var" / "www" / "safe-link"),
+          "Relative in-root symlinks remain supported");
+    unsetenv("SV_MOCK_SAFE_SYMLINK");
+
+    setenv("SV_MOCK_SPECIAL_FIFO", "1", 1);
+    auto fifo = restic_restore(std::string(64, 'a'), "files", temp.dir / "fifo-dest", false);
+    check(!fifo && !fs::exists(temp.dir / "fifo-dest"),
+          "Reject special FIFO device-like entries before publication");
+    unsetenv("SV_MOCK_SPECIAL_FIFO");
+
+    setenv("SV_MOCK_HARDLINK", "1", 1);
+    auto hardlink = restic_restore(std::string(64, 'a'), "files", temp.dir / "hardlink-dest", false);
+    check(!hardlink && !fs::exists(temp.dir / "hardlink-dest"),
+          "Reject hardlinked entries before publication");
+    unsetenv("SV_MOCK_HARDLINK");
+
+    setenv("SV_MOCK_FAIL_RESTORE", "1", 1);
+    auto partial = restic_restore(std::string(64, 'a'), "files", temp.dir / "partial-dest", false);
+    check(!partial && !fs::exists(temp.dir / "partial-dest"),
+          "Failed partial Restic extraction leaves no published destination");
+    unsetenv("SV_MOCK_FAIL_RESTORE");
+
+    setenv("SV_MOCK_EXTRA_SQL", "1", 1);
+    auto unexpected_sql = restic_restore(std::string(64, 'b'), "postgresql",
+                                         temp.dir / "unexpected-sql", true);
+    check(!unexpected_sql && !fs::exists(temp.dir / "unexpected-sql"),
+          "Unexpected files block private SQL export");
+    unsetenv("SV_MOCK_EXTRA_SQL");
+
+    const auto racing_target = temp.dir / "racing-dest";
+    setenv("SV_MOCK_RACE_DEST", racing_target.c_str(), 1);
+    auto race = restic_restore(std::string(64, 'a'), "files", racing_target, false);
+    check(!race && fs::exists(racing_target / "sentinel"),
+          "Exclusive publish refuses a newly created destination");
+    unsetenv("SV_MOCK_RACE_DEST");
+
+    std::size_t remaining_stages = 0;
+    for (const auto& item : fs::directory_iterator(temp.dir))
+        if (item.path().filename().string().starts_with(".securevault-stage-"))
+            ++remaining_stages;
+    check(remaining_stages == 0, "All failed restore staging directories cleaned");
+
     auto bad_stanza = pitr_plan_pg("../production", "2024-01-01T00:00:00Z", "/var/lib/postgresql");
     check(!bad_stanza, "PITR rejects unsafe stanza");
     auto bad_clock = pitr_plan_mariadb("2024-01-01T12:00:00", "/srv/securevault-recovery/test");
@@ -204,6 +271,34 @@ int main(int argc, char** argv) {
     check(checkpoint_after_failure && (*checkpoint_after_failure)["last_sequence"].asUInt64() == 1,
           "Upload failure never advances binlog checkpoint");
     unsetenv("SV_MOCK_UPLOAD_FAIL");
+    unsetenv("SV_MOCK_MORE_BINLOGS");
+
+    setenv("SV_MOCK_GAP_BINLOGS", "1", 1);
+    auto gap = binlog_ship(config_path, false);
+    check(!gap, "Gap in server binlog listing rejects backup");
+    unsetenv("SV_MOCK_GAP_BINLOGS");
+
+    // A corrupted/dangling checkpoint path must never be treated as new.
+    const auto dangling = state / "dangling-checkpoint.json";
+    fs::create_symlink(state / "missing-checkpoint", dangling);
+    config["state_file"] = dangling.string();
+    file(config_path, Json::writeString(builder, config));
+    auto bad_checkpoint = binlog_ship(config_path, false);
+    check(!bad_checkpoint, "Dangling checkpoint symlink fails closed");
+    config["state_file"] = (state / "checkpoint.json").string();
+    file(config_path, Json::writeString(builder, config));
+
+    setenv("SV_MOCK_MORE_BINLOGS", "1", 1);
+    setenv("SV_MOCK_BINLOG_MUTATE", "1", 1);
+    auto mutated = binlog_ship(config_path, true);
+    check(!mutated, "Closed binlog content mutation during upload fails");
+    auto after_mutation = parse_json([&]() {
+        std::ifstream in(state / "checkpoint.json");
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }());
+    check(after_mutation && (*after_mutation)["last_sequence"].asUInt64() == 1,
+          "Content mutation cannot advance the last good checkpoint");
+    unsetenv("SV_MOCK_BINLOG_MUTATE");
     unsetenv("SV_MOCK_MORE_BINLOGS");
     std::cout << "SecureVault C++23 native tests: " << (checks - failures)
               << "/" << checks << " passed\n";

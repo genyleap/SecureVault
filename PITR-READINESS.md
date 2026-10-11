@@ -74,6 +74,12 @@ content-change fingerprints before/after and advances a private state
 checkpoint only after Restic acknowledges the upload.
 
 The **active** MariaDB binlog is not uploaded. Rotating/purging logs is
-not automated. For complete PITR, a separate physical base backup and
-continuous non-gapped shipping must be operational and independently tested;
-the presence of logs or a successful local audit is not enough.
+not automated. An existing checkpoint cannot be a symlink, including a
+dangling symlink. The checkpoint file and its parent directory are synchronized
+before shipping success is reported; sync failures cause a nonzero result.
+If a closed log changes during upload or a sequence gap appears, the
+checkpoint will not advance for that segment.
+
+For complete PITR, a separate physical base backup and continuous non-gapped
+shipping must be operational and independently tested; the presence of logs
+or a successful local audit is not enough.
