@@ -1,5 +1,7 @@
 #include "operations.hpp"
 #include <array>
+#include <cerrno>
+#include <cstdlib>
 #include <chrono>
 #include <ctime>
 #include <fstream>
@@ -32,11 +34,69 @@ std::expected<void, std::string> repository_exists() {
         return std::unexpected("Off-site Restic repository is missing or inaccessible");
     return {};
 }
-std::expected<void, std::string> save_success(const fs::path& path, const std::string& stamp) {
-    std::ofstream out(path, std::ios::trunc);
-    out << stamp << '\n';
-    out.close();
-    if (!out) return std::unexpected("Failed to publish success status");
+// A private, fully-flushed temporary file is used for both the encrypted
+// remote completion marker and the local success checkpoint.
+std::expected<fs::path, std::string> write_private_temp(
+    const fs::path& directory, const std::string& prefix,
+    const std::string& contents) {
+    const std::string pattern = (directory / (prefix + "XXXXXX")).string();
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    const int fd = mkstemp(buffer.data());
+    if (fd < 0) return std::unexpected("Cannot allocate private completion record");
+    const fs::path file = buffer.data();
+    std::size_t written = 0;
+    bool ok = true;
+    while (written < contents.size()) {
+        const ssize_t n = write(fd, contents.data() + written, contents.size() - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { ok = false; break; }
+        written += static_cast<std::size_t>(n);
+    }
+    const bool synced = ok && fsync(fd) == 0;
+    const bool closed = close(fd) == 0;
+    if (!synced || !closed) {
+        unlink(file.c_str());
+        return std::unexpected("Cannot safely flush completion record");
+    }
+    return file;
+}
+std::expected<void, std::string> commit_generation(const std::string& stamp) {
+    Json::Value manifest;
+    manifest["schema"] = "securevault.restic.generation.v1";
+    manifest["generation"] = stamp;
+    manifest["files"] = true;
+    manifest["postgresql"] = true;
+    manifest["mariadb"] = true;
+    manifest["transactionally_consistent"] = false;
+    Json::StreamWriterBuilder writer;
+    auto file = write_private_temp("/var/lib/securevault", ".generation-",
+                                   Json::writeString(writer, manifest));
+    if (!file) return std::unexpected(file.error());
+    const auto uploaded = execute(
+        {"restic", "backup", "--tag", "securevault",
+         "--tag", "generation-committed", "--tag", stamp, file->string()},
+        false, std::chrono::hours{2});
+    unlink(file->c_str());
+    if (!uploaded || uploaded->exit_code != 0)
+        return std::unexpected("Restic remote generation commit failed");
+    return {};
+}
+std::expected<void, std::string> save_success(const fs::path& path,
+                                              const std::string& stamp) {
+    auto file = write_private_temp(path.parent_path(), ".last-success-",
+                                   stamp + "\n");
+    if (!file) return std::unexpected(file.error());
+    if (rename(file->c_str(), path.c_str()) != 0) {
+        unlink(file->c_str());
+        return std::unexpected("Cannot atomically publish local success marker");
+    }
+    const int dir_fd = open(path.parent_path().c_str(), O_RDONLY);
+    if (dir_fd < 0) return std::unexpected("Cannot open success state directory");
+    const bool synced = fsync(dir_fd) == 0;
+    const bool closed = close(dir_fd) == 0;
+    if (!synced || !closed)
+        return std::unexpected("Cannot durably sync local success marker");
     return {};
 }
 #endif // __linux__: helpers used only by the Linux backup coordinator
@@ -54,9 +114,13 @@ Result restic_backup() {
     for (const char* dir : {"/var/www", "/opt", "/etc", "/boot"})
         if (!fs::is_directory(dir)) return std::unexpected("Required backup directory missing");
     std::error_code ec;
-    fs::create_directories("/var/lib/securevault", ec);
+    const fs::path state_dir = "/var/lib/securevault";
+    fs::create_directories(state_dir, ec);
     if (ec) return std::unexpected("Cannot create backup state directory");
-    fs::permissions("/var/lib/securevault", fs::perms::owner_all, fs::perm_options::replace, ec);
+    const auto status = fs::symlink_status(state_dir, ec);
+    if (ec || fs::is_symlink(status) || !fs::is_directory(status))
+        return std::unexpected("Backup state directory must be a real directory");
+    fs::permissions(state_dir, fs::perms::owner_all, fs::perm_options::replace, ec);
     if (ec) return std::unexpected("Cannot secure backup state directory");
     auto repo = repository_exists();
     if (!repo) return std::unexpected(repo.error());
@@ -85,6 +149,11 @@ Result restic_backup() {
          "/var/www", "/opt", "/etc", "/boot"}, false, std::chrono::hours{12});
     if (!files || files->exit_code)
         return std::unexpected("Encrypted off-site file snapshot failed");
+
+    // Three Restic snapshots may exist after a failed producer;
+    // only this final encrypted marker commits the generation.
+    const auto committed = commit_generation(stamp);
+    if (!committed) return std::unexpected(committed.error());
     auto saved = save_success("/var/lib/securevault/last_success", stamp);
     if (!saved) return std::unexpected(saved.error());
     Json::Value result;

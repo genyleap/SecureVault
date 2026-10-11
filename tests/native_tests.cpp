@@ -44,13 +44,17 @@ int mocked(int argc, char** argv) {
     std::string action = argc > 1 ? argv[1] : "";
     if (name == "restic") {
         if (action == "stall") { sleep(3); return 0; }
-        const std::string a(64, 'a'), b(64, 'b'), c(64, 'c');
+        const std::string a(64, 'a'), b(64, 'b'), c(64, 'c'), d(64, 'd');
         if (action == "snapshots") {
             std::cout << "["
                 "{\"id\":\"" << a << "\",\"tags\":[\"securevault\",\"files\",\"20261011T090000Z\"]},"
                 "{\"id\":\"" << b << "\",\"tags\":[\"securevault\",\"postgresql\",\"20261011T090000Z\"]}"
                 << (std::getenv("SV_MOCK_MISSING_MARIA") ? "" :
                     ",{\"id\":\"" + c + "\",\"tags\":[\"securevault\",\"mariadb\",\"20261011T090000Z\"]}")
+                << (std::getenv("SV_MOCK_MISSING_COMMIT") ? "" :
+                    ",{\"id\":\"" + d + "\",\"tags\":[\"securevault\",\"generation-committed\"," +
+                    (std::getenv("SV_MOCK_MIXED_COMMIT_KIND") ? "\"files\"," : "") +
+                    "\"20261011T090000Z\"]}")
                 << "]\n";
         } else if (action == "restore") {
             std::string target;
@@ -145,10 +149,26 @@ int main(int argc, char** argv) {
     setenv("RESTIC_PASSWORD_FILE", pass.c_str(), 1);
 
     auto inventory = restic_list();
-    check(inventory && inventory->size() == 3, "Restic lists only trusted snapshots");
+    check(inventory && inventory->size() == 4,
+          "Restic inventory recognizes three data snapshots and a commit marker");
     auto groups = restic_generations();
     check(groups && groups->size() == 1 &&
-          (*groups)[0]["status"].asString() == "COMPLETE", "Three-part generation completeness");
+          (*groups)[0]["status"].asString() == "COMPLETE" &&
+          (*groups)[0]["committed"].asBool(),
+          "Generation is complete only with the final encrypted commit marker");
+    setenv("SV_MOCK_MISSING_COMMIT", "1", 1);
+    auto uncommitted = restic_generations();
+    check(uncommitted && uncommitted->size() == 1 &&
+          (*uncommitted)[0]["status"].asString() == "INCOMPLETE" &&
+          !(*uncommitted)[0]["committed"].asBool(),
+          "Three snapshot kinds without a commit marker remain INCOMPLETE");
+    unsetenv("SV_MOCK_MISSING_COMMIT");
+    setenv("SV_MOCK_MIXED_COMMIT_KIND", "1", 1);
+    auto invalid_marker = restic_generations();
+    check(invalid_marker && invalid_marker->size() == 1 &&
+          (*invalid_marker)[0]["status"].asString() == "INCOMPLETE",
+          "Commit marker with mixed backup kinds is rejected");
+    unsetenv("SV_MOCK_MIXED_COMMIT_KIND");
     setenv("SV_MOCK_MISSING_MARIA", "1", 1);
     auto incomplete = restic_generations();
     check(incomplete && (*incomplete)[0]["status"].asString() == "INCOMPLETE",

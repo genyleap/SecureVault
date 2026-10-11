@@ -149,7 +149,8 @@ std::expected<Json::Value, std::string> snapshots() {
             if (!tag.isString()) continue;
             if (tag.asString() == "securevault") marker = true;
             if (tag.asString() == "files" || tag.asString() == "mariadb" ||
-                tag.asString() == "postgresql") ++kinds;
+                tag.asString() == "postgresql" ||
+                tag.asString() == "generation-committed") ++kinds;
         }
         if (marker && kinds == 1) safe.append(item);
     }
@@ -429,14 +430,19 @@ Result restic_generations() {
             }
         }
         if (gen.empty()) continue;
-        for (const auto& kind : {"files", "postgresql", "mariadb"})
+        for (const auto& kind : {"files", "postgresql", "mariadb",
+                                 "generation-committed"})
             if (tagged(snapshot, kind)) generations[gen].insert(kind);
     }
     Json::Value result(Json::arrayValue);
     for (const auto& [stamp, kinds] : generations) {
         Json::Value record;
         record["generation"] = stamp;
-        record["status"] = kinds.size() == 3 ? "COMPLETE" : "INCOMPLETE";
+        // Three snapshots alone can exist after a failed dump/stream.
+        // Only a final encrypted Restic commit marker makes a generation
+        // eligible to be reported complete. Completeness is not integrity.
+        record["committed"] = kinds.contains("generation-committed");
+        record["status"] = kinds.size() == 4 ? "COMPLETE" : "INCOMPLETE";
         for (const auto& kind : kinds) record["kinds"].append(kind);
         result.append(record);
     }

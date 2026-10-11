@@ -101,9 +101,18 @@ securevault-ops restic check
 securevault-ops restic restore --snapshot FULL_64_HEX_ID --kind files --target /new/restore
 ```
 
-The `generations` command checks the presence of all three tagged snapshots
-(files, PostgreSQL, MariaDB), not cross-service transactional consistency.
-`check` reads repository data and may incur network/storage charges.
+The `generations` command now requires **four** matching encrypted Restic
+snapshots for `COMPLETE`: files, PostgreSQL, MariaDB, and a final
+`generation-committed` marker written **only after all three operations
+succeed**. Three component snapshots without that marker are reported as
+`INCOMPLETE`. This prevents a partially failed generation being presented
+as successful merely because three snapshot tags exist. Generations created
+by the older coordinator lack the marker and will be shown as incomplete;
+existing backups are not deleted or modified.
+
+The commit marker proves completion of the coordinator's steps, **not**
+cross-service transactional consistency, remote retention policy or verified
+file integrity. `check` reads repository data and may incur storage charges.
 
 Recovery is fail-closed: before a restored directory becomes visible at its
 destination, SecureVault rejects files with multiple hard links, FIFO/socket

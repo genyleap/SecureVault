@@ -45,9 +45,17 @@ Create/initialize the independent repository before invoking the tool.
 Test access, cost, capacity and restoration before scheduling anything.
 
 The three logical/file Restic snapshots share a generation tag but are not
-a transactionally atomic multi-database checkpoint. The log retention policy
-must be established separately; do not blindly run `forget --prune` on
-object-locked buckets.
+a transactionally atomic multi-database checkpoint. A fourth encrypted
+`generation-committed` snapshot is written only after those three stages
+succeed. `securevault-ops restic generations` requires all four kinds to
+report `COMPLETE`, preventing a successfully uploaded *partial* SQL stream
+from making a failed run appear complete. This marker indicates workflow
+completion only; it is not a substitute for a full `restic check --read-data`
+and an independent restore drill. Older generations without the marker are
+conservatively reported `INCOMPLETE`.
+
+The log retention policy must be established separately; do not blindly
+run `forget --prune` on object-locked buckets.
 
 ## Isolated restoration
 
