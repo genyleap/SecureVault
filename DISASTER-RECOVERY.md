@@ -80,6 +80,20 @@ For Genyleap's Ubuntu/XFS VPS, use separate protection layers:
 - [ ] Full software test suite passes on a separate build runner
 - [ ] Confirm all files (including symlinks, modes) restored
 
+
+## Safe file restore (development feature)
+
+The C++ CLI now supports `backup verify <archive>` and
+`backup restore <archive> <new-destination-directory>`. This operation
+verifies archive payloads, rejects unsafe paths/symlinks and performs a
+two-phase staging restore before publishing the result. The destination
+must be non-existent. The original tar.gz format remains supported.
+
+This is a **file restore only**: database point-in-time recovery, database
+import, ownership/xattrs, full disk images and full machine boot recovery
+are still outside this operation's scope. Run any actual data recovery
+on a disposable host, and compare recovered data before promotion.
+
 ## Development and tests
 
 ```bash

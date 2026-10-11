@@ -136,6 +136,7 @@ endif()
 
 # Collect source and header files
 set(SOURCE_FILES
+    src/restore.cpp
     src/backup.cpp
     src/database_backup.cpp
     src/file_backup.cpp
@@ -152,6 +153,7 @@ else()
 endif()
 
 set(HEADER_FILES
+    include/restore.hpp
     include/backup.hpp
     include/file_backup.hpp
     include/remote_transfer.hpp

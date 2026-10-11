@@ -2,6 +2,7 @@
 """Hermetic SecureVault integration tests. Never connect to live databases."""
 from __future__ import annotations
 
+import io
 import json
 import os
 from pathlib import Path
@@ -105,6 +106,91 @@ class BackupTests(unittest.TestCase):
         result = self.run_backup("daily")
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("Backup completed successfully", result.stdout)
+
+    def restore_command(self, *args):
+        return subprocess.run(
+            [BINARY, *map(str, args)],
+            text=True, capture_output=True, timeout=60, cwd=self.root,
+        )
+
+    def malicious_archive(self, name, entries):
+        archive = self.root / name
+        with tarfile.open(archive, "w:gz") as tf:
+            for kind, path, value in entries:
+                info = tarfile.TarInfo(path)
+                if kind == "file":
+                    data = value.encode()
+                    info.size = len(data)
+                    tf.addfile(info, io.BytesIO(data))
+                elif kind == "symlink":
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = value
+                    tf.addfile(info)
+        return archive
+
+    def test_verify_and_restore_roundtrip(self):
+        self.configure()
+        result = self.run_backup("daily")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        archive, = list((self.destination / "sys").glob("*.tar.gz"))
+        verify = self.restore_command("verify", archive)
+        self.assertEqual(verify.returncode, 0, verify.stderr)
+        destination = self.root / "restored"
+        restored = self.restore_command("restore", archive, destination)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        recovered = destination / self.source.relative_to("/")
+        self.assertEqual((recovered / "hello.txt").read_text(), "critical backup data\n")
+        self.assertEqual((recovered / "hello.txt").stat().st_mode & 0o777, 0o640)
+        self.assertTrue((recovered / "empty-directory").is_dir())
+        if os.name != "nt":
+            self.assertTrue((recovered / "relative-link").is_symlink())
+            self.assertEqual(os.readlink(recovered / "relative-link"), "hello.txt")
+
+    def test_restore_never_overwrites_existing_destination(self):
+        self.configure()
+        self.assertEqual(self.run_backup("daily").returncode, 0)
+        archive, = list((self.destination / "sys").glob("*.tar.gz"))
+        destination = self.root / "preexisting"
+        destination.mkdir()
+        sentinel = destination / "DO_NOT_CHANGE"
+        sentinel.write_text("important")
+        restored = self.restore_command("restore", archive, destination)
+        self.assertNotEqual(restored.returncode, 0)
+        self.assertEqual(sentinel.read_text(), "important")
+
+    def test_restore_rejects_malicious_archives(self):
+        cases = [
+            ("traversal", [("file", "../outside.txt", "attack")]),
+            ("absolute", [("file", "/tmp/unsafe.txt", "attack")]),
+            ("absolute-link", [("symlink", "link", "/etc/passwd")]),
+            ("escape-link", [("symlink", "foo/link", "../../escape")]),
+            ("symlink-ancestor", [
+                ("symlink", "a", "somewhere"),
+                ("file", "a/exploit", "attack"),
+            ]),
+            ("duplicate", [
+                ("file", "a.txt", "first"),
+                ("file", "a.txt", "second"),
+            ]),
+        ]
+        for name, entries in cases:
+            with self.subTest(name=name):
+                archive = self.malicious_archive(f"{name}.tar.gz", entries)
+                target = self.root / f"target-{name}"
+                verified = self.restore_command("verify", archive)
+                self.assertNotEqual(verified.returncode, 0, verified.stdout)
+                restored = self.restore_command("restore", archive, target)
+                self.assertNotEqual(restored.returncode, 0, restored.stdout)
+                self.assertFalse(target.exists())
+                self.assertFalse(list(self.root.glob(".securevault-restore-*")))
+
+    def test_corrupt_archive_is_rejected(self):
+        archive = self.root / "truncated.tar.gz"
+        archive.write_bytes(b"\x1f\x8b\x08\x00garbage")
+        self.assertNotEqual(self.restore_command("verify", archive).returncode, 0)
+        target = self.root / "corrupt-target"
+        self.assertNotEqual(self.restore_command("restore", archive, target).returncode, 0)
+        self.assertFalse(target.exists())
 
     def test_unsafe_incremental_refused(self):
         self.configure()

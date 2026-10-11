@@ -178,6 +178,31 @@ SecureVault uses a JSON configuration file (`backup_config.json`) to define back
 - `telegram`: Telegram notification settings (optional).
 - `email`: Email notification settings (optional, simulated).
 
+### Verify and restore backups safely
+
+SecureVault now supports archive verification and a **non-destructive** file
+restore workflow. Both commands are independent of database configuration:
+
+```bash
+./build-macos/backup verify /path/to/sys-daily-archive.tar.gz
+./build-macos/backup restore /path/to/sys-daily-archive.tar.gz /path/to/new-empty-restore
+```
+
+The destination **must not already exist**; its parent must exist.
+The restoration first validates the entire archive, stages extraction in
+a private sibling directory, and publishes the result by renaming it
+only after extraction completes. Existing files are never deliberately
+overwritten. Absolute paths, path traversal, special devices, hardlinks,
+setuid/setgid modes, symlink escapes and entries nested under archive
+symlinks are rejected. Relative symlinks within the restore root, regular
+files, directories and POSIX mode bits are supported.
+
+**Important:** This file restore does not import SQL dumps into a live
+database, doesn't restore ownership/ACLs/xattrs, and doesn't prove a
+recovered system is bootable. Run recovery in a disposable environment,
+inspect all restored files before deployment, and keep independent
+encrypted off-site copies.
+
 ## Usage
 
 ### Run a Backup

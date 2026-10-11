@@ -1,5 +1,6 @@
 #include "backup.hpp"
 #include "backup_api.hpp"
+#include "restore.hpp"
 #include <archive.h>
 #include <archive_entry.h>
 #include <iostream>
@@ -436,6 +437,34 @@ void Backup::runDaemon() {
 }
 
 int main(int argc, char* argv[]) {
+    if (argc >= 2 && std::string(argv[1]) == "verify") {
+        if (argc != 3) {
+            std::cerr << "Usage: backup verify <archive.tar.gz>\n";
+            return 2;
+        }
+        const auto result = verify_archive(argv[2]);
+        if (!result) {
+            std::cerr << "Archive verification failed: " << result.error() << '\n';
+            return 1;
+        }
+        std::cout << "Verified " << result->entries
+                  << " entries, " << result->regular_bytes << " file bytes.\n";
+        return 0;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "restore") {
+        if (argc != 4) {
+            std::cerr << "Usage: backup restore <archive.tar.gz> <new-directory>\n";
+            return 2;
+        }
+        const auto result = restore_archive(argv[2], argv[3]);
+        if (!result) {
+            std::cerr << "Restore failed: " << result.error() << '\n';
+            return 1;
+        }
+        std::cout << "Restored " << result->entries
+                  << " entries to a new directory.\n";
+        return 0;
+    }
     bool daemonMode = false;
     bool fullBackup = true;
     std::string backupType;
