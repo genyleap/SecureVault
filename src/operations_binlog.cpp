@@ -8,7 +8,7 @@
 #include <fstream>
 #include <regex>
 #include <sstream>
-#ifdef __unix__
+#if defined(__linux__) || defined(__APPLE__)
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -122,13 +122,13 @@ std::expected<std::string, std::string> upload(const fs::path& path, const std::
 struct Lock {
     int fd = -1;
     explicit Lock(const fs::path& file) {
-#ifdef __unix__
+#if defined(__linux__) || defined(__APPLE__)
         fd = open(file.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
         if (fd >= 0 && flock(fd, LOCK_EX | LOCK_NB)) { close(fd); fd = -1; }
 #endif
     }
     ~Lock() {
-#ifdef __unix__
+#if defined(__linux__) || defined(__APPLE__)
         if (fd >= 0) close(fd);
 #endif
     }
@@ -136,7 +136,7 @@ struct Lock {
     Lock& operator=(const Lock&) = delete;
 };
 std::expected<void, std::string> checkpoint(const fs::path& dest, const Json::Value& record) {
-#ifdef __unix__
+#if defined(__linux__) || defined(__APPLE__)
     auto pattern = (dest.parent_path() / ".securevault-checkpoint-XXXXXX").string();
     std::vector<char> chars(pattern.begin(), pattern.end());
     chars.push_back(0);
@@ -149,8 +149,10 @@ std::expected<void, std::string> checkpoint(const fs::path& dest, const Json::Va
         if (n <= 0) { close(fd); unlink(chars.data()); return std::unexpected("Cannot write checkpoint"); }
         written += static_cast<std::size_t>(n);
     }
-    bool ok = fsync(fd) == 0 && close(fd) == 0;
-    if (!ok || rename(chars.data(), dest.c_str()) != 0) {
+    // Always close the descriptor, even when fsync fails.
+    const bool flushed = fsync(fd) == 0;
+    const bool closed = close(fd) == 0;
+    if (!flushed || !closed || rename(chars.data(), dest.c_str()) != 0) {
         unlink(chars.data());
         return std::unexpected("Could not publish checkpoint");
     }
@@ -164,7 +166,7 @@ std::expected<void, std::string> checkpoint(const fs::path& dest, const Json::Va
 } // namespace
 
 Result binlog_ship(const fs::path& config_path, bool perform) {
-#ifndef __unix__
+#if !defined(__linux__) && !defined(__APPLE__)
     return std::unexpected("Binlog shipping currently requires Linux or macOS");
 #else
     auto ready = remote_restic();

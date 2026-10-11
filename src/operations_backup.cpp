@@ -13,6 +13,7 @@
 
 namespace securevault::ops {
 namespace {
+#if defined(__linux__)
 std::string generation_tag() {
     const auto now = std::time(nullptr);
     std::tm utc{};
@@ -38,6 +39,7 @@ std::expected<void, std::string> save_success(const fs::path& path, const std::s
     if (!out) return std::unexpected("Failed to publish success status");
     return {};
 }
+#endif // __linux__: helpers used only by the Linux backup coordinator
 } // namespace
 Result restic_backup() {
 #ifndef __linux__
