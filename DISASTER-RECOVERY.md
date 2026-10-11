@@ -108,6 +108,20 @@ separate development machine before any production deployment.
 
 Development checkout is not configured to start a service or scheduled backup.
 
+## Point-in-time database recovery readiness
+
+See [PITR-READINESS.md](PITR-READINESS.md). The new
+`scripts/pitr-readiness.py audit` command inspects PostgreSQL WAL archive
+and MariaDB binlog settings using **read-only queries**. It reports
+missing tools and prerequisites but does not alter settings or contact a
+backup destination. `plan-postgresql` and `plan-mariadb` generate
+review-only instructions for fresh isolated recovery instances.
+
+**This is not an automated PITR implementation.** Actual base backup,
+continuous remote WAL/binlog capture, retention validation, and an
+isolated successful end-to-end restore are still release blockers.
+Run `python3 tests/test_pitr_readiness.py` for mocked tests only.
+
 ## Encrypted off-site recovery commands
 
 The optional `scripts/restic-recovery.py` utility is independent of

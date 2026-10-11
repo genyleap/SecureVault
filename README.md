@@ -247,6 +247,26 @@ be significant. These workflows have automated mock-Restic tests but
 still need an end-to-end drill against a real independently hosted
 repository before production adoption.
 
+### PostgreSQL / MariaDB PITR readiness
+
+New operator-only, **read-only** prerequisite audit and isolated recovery
+plan generation are available:
+
+```bash
+python3 scripts/pitr-readiness.py audit
+python3 tests/test_pitr_readiness.py
+```
+
+The audit identifies PostgreSQL WAL and MariaDB binary-log prerequisites
+without changing running database settings. It also checks for required
+local physical backup tools. Passing local checks is **not** proof that
+the remote WAL/binlog archive is continuous or recoverable.
+
+`plan-postgresql` and `plan-mariadb` generate review-only recovery
+instructions targeted at an isolated directory, and **never run a
+database restore**. See [PITR-READINESS.md](PITR-READINESS.md) for safety
+conditions, limitations and the recovery checklist.
+
 ## Usage
 
 ### Run a Backup
