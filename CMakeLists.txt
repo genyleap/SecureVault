@@ -7,7 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-option(SECUREVAULT_BUILD_CORE "Build the tar/database backup engine" ON)
+option(SECUREVAULT_BUILD_CORE "Build the original tar/database backup engine" ON)
+option(SECUREVAULT_LEGACY_RESTIC "Build deprecated Restic compatibility tools" OFF)
 option(SECUREVAULT_REQUIRE_SFTP "Require libssh for core SFTP" ON)
 option(SECUREVAULT_AUTO_INSTALL_BREW_DEPS "Install Homebrew dependencies automatically" OFF)
 
@@ -15,10 +16,21 @@ if(APPLE)
     list(APPEND CMAKE_PREFIX_PATH
         /opt/homebrew/opt/libarchive /opt/homebrew/opt/libssh
         /opt/homebrew/opt/curl /opt/homebrew/opt/zlib
-        /opt/homebrew/opt/jsoncpp)
+        /opt/homebrew/opt/jsoncpp /opt/homebrew/opt/openssl@3)
 endif()
 
 find_package(JsonCpp REQUIRED MODULE)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+
+# Independent C++23 encrypted snapshot engine (no Restic executable).
+add_library(securevault_vault STATIC src/vault.cpp)
+target_include_directories(securevault_vault PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(securevault_vault PUBLIC OpenSSL::Crypto)
+target_compile_options(securevault_vault PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>)
+add_executable(securevault-vault src/vault_main.cpp)
+target_link_libraries(securevault-vault PRIVATE securevault_vault)
+install(TARGETS securevault-vault RUNTIME DESTINATION bin)
 
 if(SECUREVAULT_BUILD_CORE)
     find_package(LibArchive REQUIRED)
@@ -49,7 +61,8 @@ if(APPLE)
     endforeach()
 endif()
 
-# Native C++23 operations: no scripting runtime required.
+# Deprecated compatibility only. Default builds have zero Restic runtime dependency.
+if(SECUREVAULT_LEGACY_RESTIC)
 add_library(securevault_operations STATIC
     src/operations.cpp src/operations_backup.cpp
     src/operations_pitr.cpp src/operations_binlog.cpp)
@@ -60,6 +73,7 @@ target_compile_options(securevault_operations PRIVATE
 
 add_executable(securevault-ops src/ops_main.cpp)
 target_link_libraries(securevault-ops PRIVATE securevault_operations)
+endif()
 
 if(SECUREVAULT_BUILD_CORE)
     set(core_sources
@@ -86,6 +100,13 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING AND UNIX)
+    add_executable(securevault-vault-tests tests/vault_tests.cpp)
+    target_link_libraries(securevault-vault-tests PRIVATE securevault_vault)
+    target_compile_options(securevault-vault-tests PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME securevault-vault COMMAND securevault-vault-tests)
+
+    if(SECUREVAULT_LEGACY_RESTIC)
     add_executable(securevault-native-tests tests/native_tests.cpp)
     target_link_libraries(securevault-native-tests PRIVATE securevault_operations)
     target_compile_options(securevault-native-tests PRIVATE
@@ -101,16 +122,19 @@ if(BUILD_TESTING AND UNIX)
     add_test(NAME securevault-restic-real COMMAND securevault-restic-e2e-tests)
     set_tests_properties(securevault-restic-real PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 1800)
+    endif() # SECUREVAULT_LEGACY_RESTIC
 
     if(SECUREVAULT_BUILD_CORE)
         add_executable(securevault-backup-tests tests/backup_tests.cpp)
         target_link_libraries(securevault-backup-tests PRIVATE
-            securevault_operations LibArchive::LibArchive)
+            LibArchive::LibArchive jsoncpp)
         add_test(NAME securevault-backup
             COMMAND securevault-backup-tests $<TARGET_FILE:backup>)
     endif()
 endif()
 
-install(TARGETS securevault-ops RUNTIME DESTINATION bin)
+if(SECUREVAULT_LEGACY_RESTIC)
+    install(TARGETS securevault-ops RUNTIME DESTINATION bin)
+endif()
 install(FILES backup_config.json DESTINATION etc/securevault)
 install(FILES DISASTER-RECOVERY.md PITR-READINESS.md DESTINATION share/doc/securevault)

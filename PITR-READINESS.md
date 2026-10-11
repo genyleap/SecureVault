@@ -1,5 +1,11 @@
 # PostgreSQL and MariaDB PITR readiness (native C++23)
 
+> **Migration notice:** The former PITR inspector and binlog shipper belong
+> to the disabled-by-default Restic compatibility backend. The independent
+> `securevault-vault` engine currently covers authenticated file snapshots,
+> not production-ready PostgreSQL/MariaDB PITR or off-site log shipping.
+
+
 The `securevault-ops` C++23 binary inspects local database prerequisites
 with read-only SQL and generates review-only recovery plans. It never runs
 database Restore, changes server configuration, rotates binary logs, or

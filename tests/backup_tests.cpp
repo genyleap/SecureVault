@@ -1,4 +1,6 @@
-#include "operations.hpp"
+#include <expected>
+#include <sys/wait.h>
+#include <fcntl.h>
 #include <archive.h>
 #include <archive_entry.h>
 #include <json/json.h>
@@ -12,6 +14,26 @@
 namespace fs = std::filesystem;
 namespace {
 int checks = 0, errors = 0;
+std::expected<int, std::string> run(const std::vector<std::string>& args) {
+    const pid_t pid = fork();
+    if (pid < 0) return std::unexpected("Cannot fork legacy archive test");
+    if (pid == 0) {
+        const int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        std::vector<char*> argv;
+        for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+        argv.push_back(nullptr);
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return std::unexpected("Cannot wait for test subprocess");
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128;
+}
 void check(bool value, std::string_view label) {
     ++checks;
     if (!value) { ++errors; std::cerr << "FAIL: " << label << '\n'; }
@@ -79,17 +101,17 @@ int main(int argc, char** argv) {
     auto config = tmp.path / "config.json";
     Json::StreamWriterBuilder builder;
     write(config, Json::writeString(builder, cfg));
-    auto result = securevault::ops::execute({bin, "--config", config.string(), "daily"}, false);
-    check(result && result->exit_code == 0, "File-only backup succeeds");
+    auto result = run({bin, "--config", config.string(), "daily"});
+    check(result && result.value() == 0, "File-only backup succeeds");
     auto output = archive_at(backup);
     check(output.has_value(), "Full archive exists");
     if (output) {
-        auto verified = securevault::ops::execute({bin, "verify", output->string()}, false);
-        check(verified && verified->exit_code == 0, "Tar archive payload verification succeeds");
+        auto verified = run({bin, "verify", output->string()});
+        check(verified && verified.value() == 0, "Tar archive payload verification succeeds");
         auto destination = tmp.path / "recovered";
-        auto restored = securevault::ops::execute(
-            {bin, "restore", output->string(), destination.string()}, false);
-        check(restored && restored->exit_code == 0, "Safe staged extraction succeeds");
+        auto restored = run(
+            {bin, "restore", output->string(), destination.string()});
+        check(restored && restored.value() == 0, "Safe staged extraction succeeds");
         auto relative = source.relative_path();
         std::ifstream recovered(destination / relative / "critical.txt");
         std::string content;
@@ -97,28 +119,28 @@ int main(int argc, char** argv) {
         check(content == "critical backup data", "Restored file data matches");
         check(fs::is_symlink(destination / relative / "link"), "Restore preserves symlink");
         check(fs::is_directory(destination / relative / "empty"), "Empty directory is restored");
-        auto refusal = securevault::ops::execute(
-            {bin, "restore", output->string(), destination.string()}, false);
-        check(refusal && refusal->exit_code != 0, "Restore refuses overwrite");
+        auto refusal = run(
+            {bin, "restore", output->string(), destination.string()});
+        check(refusal && refusal.value() != 0, "Restore refuses overwrite");
     }
     auto invalid = tmp.path / "attack.tar.gz";
     malicious(invalid, "../escape");
-    auto reject = securevault::ops::execute({bin, "verify", invalid.string()}, false);
-    check(reject && reject->exit_code != 0, "Archive path traversal refused");
-    auto unsafe = securevault::ops::execute(
-        {bin, "--config", config.string(), "--incremental", "daily"}, false);
-    check(unsafe && unsafe->exit_code != 0, "Unsafe incremental mode is disabled");
+    auto reject = run({bin, "verify", invalid.string()});
+    check(reject && reject.value() != 0, "Archive path traversal refused");
+    auto unsafe = run(
+        {bin, "--config", config.string(), "--incremental", "daily"});
+    check(unsafe && unsafe.value() != 0, "Unsafe incremental mode is disabled");
 
     cfg["require_remote"] = true;
     write(config, Json::writeString(builder, cfg));
-    auto fail_remote = securevault::ops::execute({bin, "--config", config.string(), "daily"}, false);
-    check(fail_remote && fail_remote->exit_code != 0, "Off-site required without configuration fails");
+    auto fail_remote = run({bin, "--config", config.string(), "daily"});
+    check(fail_remote && fail_remote.value() != 0, "Off-site required without configuration fails");
     cfg["require_remote"] = false;
     cfg["backup_dirs"] = Json::arrayValue;
     cfg["backup_dirs"].append((tmp.path / "missing-source").string());
     write(config, Json::writeString(builder, cfg));
-    auto fail_missing = securevault::ops::execute({bin, "--config", config.string(), "daily"}, false);
-    check(fail_missing && fail_missing->exit_code != 0, "Missing required files fail backup");
+    auto fail_missing = run({bin, "--config", config.string(), "daily"});
+    check(fail_missing && fail_missing.value() != 0, "Missing required files fail backup");
 
     std::cout << "SecureVault C++ backup tests: " << checks - errors << '/' << checks << " passed\n";
     return errors ? 1 : 0;

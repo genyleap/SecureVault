@@ -1,175 +1,107 @@
 # SecureVault
 
-SecureVault is a native **C++23** disaster-recovery toolkit for Linux and macOS.
-There is **no Python runtime, no Python test suite, and no scripting-language
-implementation of backup or recovery logic**. All operational commands and
-regression tests are written in C++23.
+**Native C++23 encrypted backup engine**, with no dependency on the Restic executable,
+Python, or shell scripts for native snapshot creation, authentication and recovery.
 
-## Architecture
+The new primary command is \`securevault-vault\`. It uses a versioned SecureVault
+container format (\`SVLT v1\`) implemented in C++23, using **OpenSSL 3 primitives**:
+\`AES-256-GCM\` authenticated encryption, \`scrypt\` password-based key derivation
+(32768/N, r=8, p=1), fresh 128-bit salt and 96-bit nonce for every snapshot.
+This uses an established crypto library; SecureVault does **not** invent its own cipher.
 
-- `backup`: original C++23 full tar.gz backup / verify / safe staged restore,
-  MariaDB/PostgreSQL logical exports and optional SFTP.
-- `securevault-ops`: C++23 orchestration for encrypted Restic backup and
-  recovery, PostgreSQL/MariaDB PITR prerequisite inspection and plans,
-  and safe shipping of **closed** MariaDB binary-log segments.
-- `tests/native_tests.cpp`: C++23 mock-backed system, security and continuity tests.
-- `tests/backup_tests.cpp`: C++23 integration tests of the original archive engine.
-- `deploy/systemd/`: optional Linux service and 15-minute timer templates;
-  no service is installed or activated automatically.
+## Build and test
 
-**Not production-certified:** Continuous PostgreSQL WAL archive, independent
-storage retention and immutability, durable physical database base backups,
-end-to-end disaster recovery and RPO/RTO measurements still require
-configuration and real restoration drills.
+Required: CMake >=3.26, a C++23 compiler and OpenSSL development files.
+The original tar/database core additionally requires libarchive, JSONCPP,
+libcurl, zlib and optionally libssh.
 
-## Build
+On macOS, install prerequisites with Homebrew (\`openssl@3\`,
+\`cmake\`, \`ninja\`, plus packages required for the original core):
 
-Linux prerequisites: CMake, a C++23-capable compiler, libarchive, libssh,
-libcurl, zlib and JsonCpp development headers. On macOS use Homebrew LLVM
-and `brew install cmake ninja llvm libarchive libssh curl jsoncpp zlib`.
-
-```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+\`\`\`bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++ \
+  -DSECUREVAULT_BUILD_CORE=OFF
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
-```
+\`\`\`
 
-### Real encrypted-recovery drill (disposable local fixture)
+The native vault is enabled by default, and the historical
+\`SECUREVAULT_LEGACY_RESTIC\` compatibility build option defaults to **OFF**.
+**No Restic binary needs to be installed.** This option retains a deprecated
+source migration path temporarily, not a runtime requirement for the native
+vault. It must not be enabled for production.
 
-`securevault-restic-real` is an **optional C++23 CTest integration test**
-that uses the actual `restic` executable if available. It initializes an
-encrypted repository **only in a newly created private temporary directory**,
-backs up synthetic files plus separate synthetic PostgreSQL/MariaDB SQL
-fixtures, then creates a v2 generation manifest. It uses the same C++23
-manifest inspector as production to verify that three data snapshots alone
-are INCOMPLETE, that the encrypted marker is read using `restic dump` and
-that the matching four-snapshot generation is COMPLETE. It also checks
-duplicate-marker rejection, repository data integrity, restored bytes and
-relative symlinks, incorrect passwords, and a plaintext-leak smoke check.
-All fixtures are deleted afterward. The production remote-only preflight
-remains mandatory; the local repository is accessible solely to the
-integration harness.
+## Create, list, authenticate and restore snapshots
 
-```bash
-brew install restic           # Optional dependency on macOS; do this manually
-ctest --test-dir build --output-on-failure -V
-```
+Initialize an empty private directory, and create a password file protected
+by mode \`0600\`. Do not save the key file inside the backed-up tree or vault.
+Use a strong randomly generated password held independently of the archives.
 
-If `restic` is not installed, CTest reports this case as **Skipped** rather
-than treating a mock as a real encryption test. This is not an off-site
-recovery drill: SecureVault's production `RESTIC_REPOSITORY` still requires
-an independent remote storage backend, and the local fixture test never
-weakens that requirement.
+\`\`\`bash
+securevault-vault init --repo /absolute/private/vault
+securevault-vault create --repo /absolute/private/vault \
+  --source /absolute/test-fixtures --password-file /absolute/keyfile
+securevault-vault list --repo /absolute/private/vault
+securevault-vault verify --snapshot /absolute/private/vault/<snapshot-id>.svlt \
+  --password-file /absolute/keyfile
+securevault-vault restore --snapshot /absolute/private/vault/<snapshot-id>.svlt \
+  --target /absolute/new-recovery-folder --password-file /absolute/keyfile
+\`\`\`
 
-External subprocesses executed through the native process runner now have
-bounded execution deadlines, including both ends of the piped
-database-dump-to-Restic workflow. Failure or timeout stops the corresponding
-process group and refuses to mark that generation successful. Database/probe
-operations use shorter defaults, while full repository checks, streaming
-dumps and large restores have explicitly longer limits.
+Restore targets must be new and cannot replace existing directories. Files
+are restored with mode \`0600\` and directories with \`0700\`. Regular files,
+empty directories and safe relative symlinks are supported. Unknown objects,
+hardlinks, escaping symlinks and duplicate paths are rejected. Snapshot
+creation uses a private temporary file and atomic no-overwrite publication.
+Restoration authenticates the **entire** encrypted archive before writing the
+recovery tree, authenticates it again during extraction and publishes only
+after successful verification.
 
-On macOS you can explicitly select
-`-DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++`.
-Use a fresh build directory after changing compilers. CMake never installs
-Homebrew packages automatically.
+\`verify\` checks the authenticated encryption tag, not a complete application
+restore. To establish recoverability, run a full \`restore\` into a disposable
+location and inspect application semantics as well.
 
-For testing the new native operations without the older archive engine:
+## Important limits
 
-```bash
-cmake -S . -B build-ops -G Ninja -DSECUREVAULT_BUILD_CORE=OFF
-cmake --build build-ops --parallel
-ctest --test-dir build-ops --output-on-failure
-```
+- **Not ready for production off-site disaster recovery.** The new backend
+  currently stores encrypted snapshots in a local/private directory. Its
+  independent off-host transport (e.g. SFTP or object storage), retention
+  policies, scheduling, monitoring and verified failure recovery are still to
+  be implemented and tested. A local encrypted copy is not an off-site backup.
+- The v1 container is streaming, but each snapshot is limited to under
+  **32 GiB of encrypted payload** because it uses one AES-GCM nonce per
+  snapshot. Larger datasets require a future independently authenticated
+  chunked container format; do not split encrypted snapshots manually.
+- This first native milestone does not deduplicate, compress, preserve
+  all POSIX ownership/ACL/xattrs or implement incremental snapshots.
+- PostgreSQL and MariaDB backups need a separately validated coordination
+  layer and isolated recovery tests. The original C++ tar/SQL engine is
+  available separately, but its unencrypted outputs should not be mistaken
+  for new native encrypted snapshots.
+- The deprecated Restic operations are **not built or installed by default**;
+  they still exist in the repository during migration. Do not deploy or
+  schedule that legacy path. The new native vault has no Restic dependency.
+- Do not point development tests at live data or production repositories.
+  CTest uses only disposable synthetic files and directories.
 
-## Legacy archive engine
+## Security testing
 
-```bash
-./build/backup --config backup_config.json daily
-./build/backup verify /path/to/system-backup.tar.gz
-./build/backup restore /path/to/system-backup.tar.gz /new/nonexistent/destination
-```
+\`tests/vault_tests.cpp\` performs real AES-256-GCM/scrypt roundtrips without
+mocking a third-party backup process. It covers binary data, subfolders,
+empty directories, safe symlinks, bad passwords, insecure keys, tampering,
+truncation, hardlinks, unsafe paths, and accidental recursive self-backup.
 
-The unsafe timestamp-only incremental implementation remains disabled.
-Restoration rejects traversal, special files and unsafe links and never
-deliberately overwrites an existing destination. Tar/SQL exports from the
-legacy engine are **not encrypted at rest**.
+## Existing documentation
 
-## Native encrypted Restic operations
+- [DISASTER-RECOVERY.md](DISASTER-RECOVERY.md) describes the historical
+  operational setup and recovery acceptance criteria; references to Restic
+  there are **legacy** and not part of the native vault.
+- [PITR-READINESS.md](PITR-READINESS.md) describes the separate experimental
+  point-in-time-recovery planner and legacy log shipping module, not complete
+  native PITR support.
 
-Set `RESTIC_REPOSITORY` to an **independent off-host** Restic repository
-and `RESTIC_PASSWORD_FILE` to a private 0600 password file. Configure
-storage access separately using least-privilege credentials. No secrets
-should be committed or supplied directly on the command line.
-
-```bash
-securevault-ops restic list
-securevault-ops restic generations
-securevault-ops restic check
-securevault-ops restic restore --snapshot FULL_64_HEX_ID --kind files --target /new/restore
-```
-
-The `generations` command requires **four** matching encrypted Restic
-snapshots for `COMPLETE`: files, PostgreSQL, MariaDB, and a final
-`generation-committed` marker written **only after all three operations
-succeed**. The **v2 encrypted manifest** records the exact full Snapshot ID
-of each component. SecureVault reads the manifest back from Restic and
-compares all three IDs to the inventory, rejecting duplicate kinds,
-missing snapshots, inaccessible manifests and mismatches. A marker's tags
-alone never establish completion. Existing v1/markerless generations
-are reported as `INCOMPLETE` without modifying stored backups.
-
-The commit marker proves completion of the coordinator's steps, **not**
-cross-service transactional consistency, remote retention policy or verified
-file integrity. `check` reads repository data and may incur storage charges.
-
-Recovery is fail-closed: before a restored directory becomes visible at its
-destination, SecureVault rejects files with multiple hard links, FIFO/socket
-or device entries, absolute/escaping symlinks, and incomplete extractions.
-Safe relative symlinks remain supported. **Hardlinked regular files are
-deliberately not yet supported**, even if they originated from valid snapshots.
-The target directory must not already exist, including in a concurrent race.
-
-For a database SQL export use `--kind postgresql` or
-`--kind mariadb` and **explicitly** add `--allow-plaintext-export`.
-The command restores only into a new directory; it never imports SQL into
-a running database. Plaintext SQL must be protected and disposed of safely.
-
-The manual Linux-only encrypted off-site coordinator is:
-
-```bash
-securevault-ops restic backup
-```
-
-It requires suitable privileges and independently initialized Restic storage.
-It streams logical database dumps into encrypted Restic snapshots and then
-takes a file snapshot. It is **not PITR** and does not include all live Docker
-volume consistency guarantees. A tagged generation can be incomplete if a
-step fails; the success marker is written only after all steps succeed.
-
-## Database PITR readiness and closed-binlog shipping
-
-```bash
-securevault-ops pitr audit
-securevault-ops pitr plan-postgresql --stanza genyleap \
-  --target-time '2026-10-10T02:00:00+00:00' \
-  --dest /srv/securevault-recovery/postgresql-new
-securevault-ops pitr plan-mariadb \
-  --target-time '2026-10-10T02:00:00+00:00' \
-  --dest /srv/securevault-recovery/mariadb-new
-securevault-ops binlog ship --config /etc/securevault/binlog.json
-```
-
-The binlog command defaults to a non-mutating **dry run**. Add `--execute`
-only after checking the configuration, base backup and remote storage.
-The active log is never shipped; only closed logs are eligible, with
-continuity checks and a checkpoint written after acknowledged upload.
-See [PITR-READINESS.md](PITR-READINESS.md) and
-[DISASTER-RECOVERY.md](DISASTER-RECOVERY.md).
-
-## Safety
-
-No code checkout, CMake build or `ctest` run enables production backup,
-rotates logs, modifies database configuration, or starts an automatic restore.
-A real disaster recovery test on a disposable host is mandatory before
-production use. Keep a separate independently encrypted backup **now**;
-do not depend on unfinished SecureVault development as your sole backup.
+**Production safety:** Running CMake/CTest never installs/starts a backup
+scheduler, changes DB configuration, or touches running services. Keep an
+independently verified existing backup system until the native replacement
+passes complete off-site restore acceptance testing.

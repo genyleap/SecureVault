@@ -1,5 +1,12 @@
 # SecureVault disaster recovery runbook (C++23)
 
+> **LEGACY BACKEND REFERENCE:** This runbook describes the older Restic-based
+> coordinator, which is disabled by default. The new `securevault-vault`
+> executable uses an independent AES-256-GCM engine and does not run Restic.
+> Off-site transfer and complete PITR support are **not yet migrated** to the
+> new engine. Do not deploy the historical Restic scheduler templates.
+
+
 ## System boundaries
 
 The native C++23 `backup` executable handles full tar backups and safe
@@ -37,9 +44,10 @@ securevault-ops restic check
 securevault-ops restic backup
 ```
 
-The backup operation is explicit and Linux-only. A sample systemd service
-and 15-minute timer are under `deploy/systemd/` but are not enabled by
-building the project. Configure `RESTIC_REPOSITORY` and the root-only
+The old coordinator is disabled by default and its obsolete systemd service
+and timer templates have been removed from the working branch. This section
+is retained for historical migration context only. Configure
+`RESTIC_REPOSITORY` and the root-only
 `RESTIC_PASSWORD_FILE` on the operator-controlled backup host.
 Create/initialize the independent repository before invoking the tool.
 Test access, cost, capacity and restoration before scheduling anything.
