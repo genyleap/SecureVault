@@ -203,6 +203,50 @@ recovered system is bootable. Run recovery in a disposable environment,
 inspect all restored files before deployment, and keep independent
 encrypted off-site copies.
 
+### Recover encrypted off-site Restic snapshots
+
+The optional `scripts/restic-recovery.py` tool works with snapshots
+written by `scripts/backup-restic.sh`. It does not connect to a live
+database, overwrite a restore target, prune backups, or change the
+repository. Configure an existing Restic repository through the environment:
+
+```bash
+export RESTIC_REPOSITORY='s3:YOUR-INDEPENDENT-BACKUP-LOCATION'
+export RESTIC_PASSWORD_FILE='/path/to/root-only/restic-password'
+
+python3 scripts/restic-recovery.py list
+python3 scripts/restic-recovery.py generations
+python3 scripts/restic-recovery.py check
+
+# Use the *full* 64-character ID returned by "list".
+python3 scripts/restic-recovery.py restore \
+  --snapshot FULL_64_CHARACTER_SNAPSHOT_ID \
+  --kind files \
+  --target /path/to/a/new-directory
+```
+
+`generations` marks runs **COMPLETE** only when matching-tag file,
+PostgreSQL and MariaDB snapshots all exist. Completeness does not imply
+a transactionally consistent cross-service point in time.
+
+SQL snapshots can be exported into a private new directory by selecting
+`--kind postgresql` or `--kind mariadb` and explicitly supplying
+`--allow-plaintext-export`. This never imports SQL into an existing
+database. The exported files are sensitive plaintext (mode 0600 on
+POSIX); remove them securely when no longer required.
+
+Recoveries use a private staging directory followed by an exclusive,
+atomic no-overwrite directory publish on Linux/macOS. Files outside the
+target are never intentionally changed. Restored symlinks escaping the
+private restore root are rejected. Existing directories are never
+replaced, even if another process creates one during extraction.
+
+**Security note:** `check` uses `restic check --read-data`, potentially
+downloading and decrypting the entire repository; storage costs can
+be significant. These workflows have automated mock-Restic tests but
+still need an end-to-end drill against a real independently hosted
+repository before production adoption.
+
 ## Usage
 
 ### Run a Backup

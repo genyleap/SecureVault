@@ -108,6 +108,29 @@ separate development machine before any production deployment.
 
 Development checkout is not configured to start a service or scheduled backup.
 
+## Encrypted off-site recovery commands
+
+The optional `scripts/restic-recovery.py` utility is independent of
+the C++ tar restore. It requires an existing Restic repository and a
+private `RESTIC_PASSWORD_FILE`. Commands:
+
+- `list`: list SecureVault-tagged Restic snapshot IDs and their types
+- `generations`: report matching-tag three-part backup generations as
+  COMPLETE or INCOMPLETE; a complete tag does not guarantee atomicity
+- `check`: verify all repository data with `restic check --read-data`
+- `restore --snapshot <64-hex-id> --kind files --target <new-dir>`:
+  restore files to a previously nonexistent directory via private staging
+- For PostgreSQL/MariaDB, use `--kind postgresql` or `--kind mariadb`
+  with `--allow-plaintext-export`. This creates only a private SQL export;
+  no database import or destructive restore is performed.
+
+Restoring from a real off-site repository must be tested on a disposable
+machine before marking the system production-ready. Automated tests mock
+the Restic CLI and check refusal of overwrite, racing destination
+creation, failed recovery cleanup, SQL privacy gating, and generation
+completeness. Do not confuse these tests with a real end-to-end recovery
+drill.
+
 ## Optional encrypted Restic coordinator (development preview)
 
 `scripts/backup-restic.sh` is a separate, Linux-only encrypted off-site
