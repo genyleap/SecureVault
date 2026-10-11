@@ -51,5 +51,8 @@ CMakeLists.txt.user
 
 # SecureVault CI/hardening build artifacts
 build-hardening/
+build-native/
+build-ops/
+build-macos/
 __pycache__/
 *.pyc

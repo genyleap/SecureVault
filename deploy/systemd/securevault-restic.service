@@ -13,7 +13,7 @@ Group=root
 Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 Environment=RESTIC_CACHE_DIR=/var/cache/securevault
 EnvironmentFile=/etc/securevault/restic.env
-ExecStart=/usr/local/libexec/securevault/backup-restic.sh
+ExecStart=/usr/local/bin/securevault-ops restic backup
 StateDirectory=securevault
 CacheDirectory=securevault
 RuntimeDirectory=securevault

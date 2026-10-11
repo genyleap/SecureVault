@@ -1,350 +1,124 @@
-# SecureVault Backup System
+# SecureVault
 
-> **Hardening development branch — not yet production-certified.** The automated backup
-> runner has been changed to fail closed on database/remote-transfer errors.
-> The old mtime-only incremental mode is intentionally disabled until a
-> restorable manifest-based design or Restic backend is integrated.
-> The built-in tar/SQL output is **not encrypted at rest**. Store it only on
-> trusted encrypted media; do not expose backup files via the web.
->
-> Read [DISASTER-RECOVERY.md](DISASTER-RECOVERY.md) for a recovery strategy,
-> prerequisites and a deployment checklist. No backup job is enabled merely
-> by cloning or compiling this repository.
+SecureVault is a native **C++23** disaster-recovery toolkit for Linux and macOS.
+There is **no Python runtime, no Python test suite, and no scripting-language
+implementation of backup or recovery logic**. All operational commands and
+regression tests are written in C++23.
 
-### Hardening updates
+## Architecture
 
-- Manual `--config /absolute/path.json` now reaches the executor.
-- `backup daily` runs a **full** snapshot by default; `--incremental`
-  explicitly fails until safe incremental retention/deletion tracking exists.
-- `require_remote: true` makes an absent SFTP destination or failed upload
-  a hard failure instead of a false-positive success.
-- Archive verification reads all payload bytes and rejects malformed or
-  empty archives. Local directory unreadability is treated as failure.
-- Full file archives now retain directory entries, symbolic links, relative
-  paths and original POSIX permission bits.
-- Database credential temporary files are exclusively created with mode 0600
-  on POSIX. Database tools execute without inherited `LD_LIBRARY_PATH`.
-- SFTP uploads use a temporary remote name and publish only after complete
-  transfer. Regression tests are under `tests/`.
+- `backup`: original C++23 full tar.gz backup / verify / safe staged restore,
+  MariaDB/PostgreSQL logical exports and optional SFTP.
+- `securevault-ops`: C++23 orchestration for encrypted Restic backup and
+  recovery, PostgreSQL/MariaDB PITR prerequisite inspection and plans,
+  and safe shipping of **closed** MariaDB binary-log segments.
+- `tests/native_tests.cpp`: C++23 mock-backed system, security and continuity tests.
+- `tests/backup_tests.cpp`: C++23 integration tests of the original archive engine.
+- `deploy/systemd/`: optional Linux service and 15-minute timer templates;
+  no service is installed or activated automatically.
 
-**Still missing for production**: authenticated encrypted-at-rest repository,
-point-in-time database recovery using WAL/binlogs, off-host immutable copies,
-verified restore drills and cross-platform security review. Treat these as
-release blockers, not optional enhancements.
+**Not production-certified:** Continuous PostgreSQL WAL archive, independent
+storage retention and immutability, durable physical database base backups,
+end-to-end disaster recovery and RPO/RTO measurements still require
+configuration and real restoration drills.
 
+## Build
 
-**SecureVault** is a robust, cross-platform backup solution designed for automated, secure, and efficient backups of files and databases. Written in modern C++23, it supports Linux, Windows, and macOS, offering flexible scheduling, incremental backups, database support (MySQL, PostgreSQL), remote transfers via SFTP, and notifications via Telegram or email. SecureVault is ideal for system administrators and developers needing a reliable backup tool for critical data.
-
-## Features
-
-- **Cross-Platform**: Runs on Linux (Ubuntu), Windows, and macOS with platform-specific default directories and configurations.
-- **File Backups**: Performs full or incremental backups of specified directories using tar.gz compression, with customizable file exclusion by extension.
-- **Database Backups**: Supports MySQL and PostgreSQL, backing up all databases to compressed `.sql.gz` files.
-- **Scheduling**: Configurable backup schedules (daily, weekly, monthly) with precise timing and day-of-week/month options.
-- **Remote Transfers**: Securely transfers backups to remote servers via SFTP.
-- **Notifications**: Sends success or failure notifications via Telegram or email (email currently simulated; SMTP support planned).
-- **Retention Policy**: Automatically cleans up old backups based on a configurable retention period.
-- **Logging**: Detailed logging of backup operations and errors to dedicated log files.
-- **Verification**: Validates backup integrity using `libarchive` to ensure reliability.
-- **Modern C++23**: Leverages C++23 features for performance and maintainability, with strict compiler requirements (GCC 13+, Clang 16+, MSVC 19.29+).
-
-## Prerequisites
-
-### Dependencies
-- **C++ Compiler**: GCC 13+, Clang 16+, or MSVC 19.29+ with C++23 support.
-- **Libraries**:
-  - `libarchive` (file compression and verification)
-  - `libssh` (SFTP transfers)
-  - `libcurl` (Telegram notifications)
-  - `zlib` (compression)
-  - `jsoncpp` (configuration parsing)
-
-### Platform-Specific Requirements
-- **Linux (Ubuntu 24.04)**:
-  - Install dependencies: `sudo apt install -y libarchive-dev libssh-dev libcurl4-openssl-dev zlib1g-dev libjsoncpp-dev cmake g++`
-- **Windows**:
-  - Install vcpkg: `git clone https://github.com/microsoft/vcpkg && cd vcpkg && bootstrap-vcpkg.bat`
-  - Install dependencies: `vcpkg install libarchive libssh libcurl jsoncpp zlib`
-- **macOS**:
-  - Install Homebrew: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
-  - Install dependencies: `brew install libarchive libssh libcurl jsoncpp zlib cmake`
-
-## Installation
-
-### Clone the Repository
-```bash
-git clone https://github.com/genyleap/securevault.git
-cd securevault
-```
-
-### Build on Linux
-```bash
-mkdir build && cd build
-cmake ..
-make
-sudo make install
-```
-
-### Build on Windows
-```bash
-mkdir build && cd build
-cmake .. -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build . --config Release
-cmake --install .
-```
-
-### Build on macOS (Homebrew LLVM / Apple Silicon)
-```bash
-brew install cmake ninja llvm libarchive libssh curl jsoncpp zlib
-cmake -S . -B build/macos-clang -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++ \
-  -DSECUREVAULT_AUTO_INSTALL_BREW_DEPS=OFF
-cmake --build build/macos-clang --parallel
-```
-
-The Apple SDK C headers are already included by Clang through its sysroot.
-**Do not manually add** `MacOSX.sdk/usr/include` to `CMAKE_CXX_FLAGS`
-or `target_include_directories`: placing it before Homebrew LLVM's
-`libc++` wrappers produces errors such as `<cwctype> ... <wctype.h>`,
-`<cstring> ... <string.h>`, and the `isinf` macro failure.
-The CMake configuration filters accidental SDK C include paths exported by
-dependency targets. For Qt Creator, clear the existing CMake configuration
-or choose a **new build directory** when switching toolchains, then
-reconfigure and rebuild. Qt is not a project dependency.
-
-## Configuration
-
-SecureVault uses a JSON configuration file (`backup_config.json`) to define backup settings. The default paths are:
-- **Linux**: `/var/www/genyleap.com/public_html/app/backup_system/backup_config.json`
-- **Windows**: `C:/Backups/SecureVault/backup_config.json`
-- **macOS**: `/Users/Shared/Backups/SecureVault/backup_config.json`
-
-### Example Configuration
-```json
-{
-    "backup_base": "/var/backups/securevault/",
-    "backup_dirs": ["/var/www/", "/etc/nginx/"],
-    "exclude_extensions": [".tmp", ".bak", ".log", ".cache"],
-    "retention_days": 7,
-    "databases": [
-        {
-            "type": "mysql",
-            "user": "root",
-            "password": "your_mysql_password",
-            "host": "localhost",
-            "port": 3306
-        },
-        {
-            "type": "postgresql",
-            "user": "postgres",
-            "password": "your_postgres_password",
-            "host": "localhost",
-            "port": 5432
-        }
-    ],
-    "schedule": {
-        "type": "daily",
-        "time": "15:25:00",
-        "day_of_week": "monday",
-        "day_of_month": 1
-    },
-    "sftp": {
-        "host": "remote.example.com",
-        "user": "sftp_user",
-        "password": "sftp_password",
-        "port": 22,
-        "remote_dir": "/backups/"
-    },
-    "telegram": {
-        "bot_token": "your_bot_token",
-        "chat_id": "your_chat_id"
-    },
-    "email": {
-        "email_to": "admin@example.com",
-        "smtp_server": "smtp.example.com"
-    }
-}
-```
-
-### Configuration Fields
-- `backup_base`: Base directory for backup files (e.g., `/var/backups/securevault/`).
-- `backup_dirs`: List of directories to back up.
-- `exclude_extensions`: File extensions to exclude from backups.
-- `retention_days`: Number of days to retain backups.
-- `databases`: Array of database configurations (MySQL or PostgreSQL).
-- `schedule`: Backup schedule (`daily`, `weekly`, `monthly`) with time and day settings.
-- `sftp`: Remote server details for SFTP transfers (optional).
-- `telegram`: Telegram notification settings (optional).
-- `email`: Email notification settings (optional, simulated).
-
-### Verify and restore backups safely
-
-SecureVault now supports archive verification and a **non-destructive** file
-restore workflow. Both commands are independent of database configuration:
+Linux prerequisites: CMake, a C++23-capable compiler, libarchive, libssh,
+libcurl, zlib and JsonCpp development headers. On macOS use Homebrew LLVM
+and `brew install cmake ninja llvm libarchive libssh curl jsoncpp zlib`.
 
 ```bash
-./build-macos/backup verify /path/to/sys-daily-archive.tar.gz
-./build-macos/backup restore /path/to/sys-daily-archive.tar.gz /path/to/new-empty-restore
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 ```
 
-The destination **must not already exist**; its parent must exist.
-The restoration first validates the entire archive, stages extraction in
-a private sibling directory, and publishes the result by renaming it
-only after extraction completes. Existing files are never deliberately
-overwritten. Absolute paths, path traversal, special devices, hardlinks,
-setuid/setgid modes, symlink escapes and entries nested under archive
-symlinks are rejected. Relative symlinks within the restore root, regular
-files, directories and POSIX mode bits are supported.
+On macOS you can explicitly select
+`-DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++`.
+Use a fresh build directory after changing compilers. CMake never installs
+Homebrew packages automatically.
 
-**Important:** This file restore does not import SQL dumps into a live
-database, doesn't restore ownership/ACLs/xattrs, and doesn't prove a
-recovered system is bootable. Run recovery in a disposable environment,
-inspect all restored files before deployment, and keep independent
-encrypted off-site copies.
-
-### Recover encrypted off-site Restic snapshots
-
-The optional `scripts/restic-recovery.py` tool works with snapshots
-written by `scripts/backup-restic.sh`. It does not connect to a live
-database, overwrite a restore target, prune backups, or change the
-repository. Configure an existing Restic repository through the environment:
+For testing the new native operations without the older archive engine:
 
 ```bash
-export RESTIC_REPOSITORY='s3:YOUR-INDEPENDENT-BACKUP-LOCATION'
-export RESTIC_PASSWORD_FILE='/path/to/root-only/restic-password'
-
-python3 scripts/restic-recovery.py list
-python3 scripts/restic-recovery.py generations
-python3 scripts/restic-recovery.py check
-
-# Use the *full* 64-character ID returned by "list".
-python3 scripts/restic-recovery.py restore \
-  --snapshot FULL_64_CHARACTER_SNAPSHOT_ID \
-  --kind files \
-  --target /path/to/a/new-directory
+cmake -S . -B build-ops -G Ninja -DSECUREVAULT_BUILD_CORE=OFF
+cmake --build build-ops --parallel
+ctest --test-dir build-ops --output-on-failure
 ```
 
-`generations` marks runs **COMPLETE** only when matching-tag file,
-PostgreSQL and MariaDB snapshots all exist. Completeness does not imply
-a transactionally consistent cross-service point in time.
-
-SQL snapshots can be exported into a private new directory by selecting
-`--kind postgresql` or `--kind mariadb` and explicitly supplying
-`--allow-plaintext-export`. This never imports SQL into an existing
-database. The exported files are sensitive plaintext (mode 0600 on
-POSIX); remove them securely when no longer required.
-
-Recoveries use a private staging directory followed by an exclusive,
-atomic no-overwrite directory publish on Linux/macOS. Files outside the
-target are never intentionally changed. Restored symlinks escaping the
-private restore root are rejected. Existing directories are never
-replaced, even if another process creates one during extraction.
-
-**Security note:** `check` uses `restic check --read-data`, potentially
-downloading and decrypting the entire repository; storage costs can
-be significant. These workflows have automated mock-Restic tests but
-still need an end-to-end drill against a real independently hosted
-repository before production adoption.
-
-### PostgreSQL / MariaDB PITR readiness
-
-New operator-only, **read-only** prerequisite audit and isolated recovery
-plan generation are available:
+## Legacy archive engine
 
 ```bash
-python3 scripts/pitr-readiness.py audit
-python3 tests/test_pitr_readiness.py
+./build/backup --config backup_config.json daily
+./build/backup verify /path/to/system-backup.tar.gz
+./build/backup restore /path/to/system-backup.tar.gz /new/nonexistent/destination
 ```
 
-The audit identifies PostgreSQL WAL and MariaDB binary-log prerequisites
-without changing running database settings. It also checks for required
-local physical backup tools. Passing local checks is **not** proof that
-the remote WAL/binlog archive is continuous or recoverable.
+The unsafe timestamp-only incremental implementation remains disabled.
+Restoration rejects traversal, special files and unsafe links and never
+deliberately overwrites an existing destination. Tar/SQL exports from the
+legacy engine are **not encrypted at rest**.
 
-`plan-postgresql` and `plan-mariadb` generate review-only recovery
-instructions targeted at an isolated directory, and **never run a
-database restore**. See [PITR-READINESS.md](PITR-READINESS.md) for safety
-conditions, limitations and the recovery checklist.
+## Native encrypted Restic operations
 
-## Usage
+Set `RESTIC_REPOSITORY` to an **independent off-host** Restic repository
+and `RESTIC_PASSWORD_FILE` to a private 0600 password file. Configure
+storage access separately using least-privilege credentials. No secrets
+should be committed or supplied directly on the command line.
 
-### Run a Backup
 ```bash
-backup [--config <path>] [--full] {daily|monthly|yearly}
+securevault-ops restic list
+securevault-ops restic generations
+securevault-ops restic check
+securevault-ops restic restore --snapshot FULL_64_HEX_ID --kind files --target /new/restore
 ```
-- `--config <path>`: Specify a custom configuration file path.
-- `--full`: Perform a full backup (default is full; unsafe legacy incremental is disabled).
-- `daily|monthly|yearly`: Backup type.
 
-Example:
+The `generations` command checks the presence of all three tagged snapshots
+(files, PostgreSQL, MariaDB), not cross-service transactional consistency.
+`check` reads repository data and may incur network/storage charges.
+
+For a database SQL export use `--kind postgresql` or
+`--kind mariadb` and **explicitly** add `--allow-plaintext-export`.
+The command restores only into a new directory; it never imports SQL into
+a running database. Plaintext SQL must be protected and disposed of safely.
+
+The manual Linux-only encrypted off-site coordinator is:
+
 ```bash
-backup daily
+securevault-ops restic backup
 ```
 
-### Run in Daemon Mode
-Run SecureVault as a background process with scheduled backups:
+It requires suitable privileges and independently initialized Restic storage.
+It streams logical database dumps into encrypted Restic snapshots and then
+takes a file snapshot. It is **not PITR** and does not include all live Docker
+volume consistency guarantees. A tagged generation can be incomplete if a
+step fails; the success marker is written only after all steps succeed.
+
+## Database PITR readiness and closed-binlog shipping
+
 ```bash
-backup --daemon [--config <path>]
-```
-Example:
-```bash
-backup --daemon
-```
-
-### Logs
-- Backup logs: `<backup_base>/backup.log`
-- Error logs: `<backup_base>/errors.log`
-- Last backup timestamp: `<backup_base>/last_backup.txt`
-
-Example:
-```bash
-cat /var/backups/securevault/backup.log
+securevault-ops pitr audit
+securevault-ops pitr plan-postgresql --stanza genyleap \
+  --target-time '2026-10-10T02:00:00+00:00' \
+  --dest /srv/securevault-recovery/postgresql-new
+securevault-ops pitr plan-mariadb \
+  --target-time '2026-10-10T02:00:00+00:00' \
+  --dest /srv/securevault-recovery/mariadb-new
+securevault-ops binlog ship --config /etc/securevault/binlog.json
 ```
 
-## Directory Structure
-```
-securevault/
-├── src/                  # Source files
-│   ├── backup.cpp
-│   ├── database_backup.cpp
-│   ├── file_backup.cpp
-│   ├── remote_transfer.cpp
-│   ├── notification.cpp
-│   ├── backup_config.cpp
-│   ├── backup_api.cpp
-├── include/              # Header files
-│   ├── backup.hpp
-│   ├── file_backup.hpp
-│   ├── remote_transfer.hpp
-│   ├── notification.hpp
-│   ├── backup_config.hpp
-│   ├── backup_api.hpp
-├── cmake/                # Custom CMake modules
-│   ├── FindLibssh.cmake
-│   ├── FindJsonCpp.cmake
-├── backup_config.json    # Default configuration file
-├── CMakeLists.txt        # CMake build configuration
-├── README.md             # This file
-```
+The binlog command defaults to a non-mutating **dry run**. Add `--execute`
+only after checking the configuration, base backup and remote storage.
+The active log is never shipped; only closed logs are eligible, with
+continuity checks and a checkpoint written after acknowledged upload.
+See [PITR-READINESS.md](PITR-READINESS.md) and
+[DISASTER-RECOVERY.md](DISASTER-RECOVERY.md).
 
-## Contributing
-Contributions are welcome! To contribute:
-1. Fork the repository.
-2. Create a feature branch: `git checkout -b feature/your-feature`.
-3. Commit changes: `git commit -m "Add your feature"`.
-4. Push to the branch: `git push origin feature/your-feature`.
-5. Open a pull request.
+## Safety
 
-Please ensure code follows C++23 standards and includes appropriate documentation.
-
-## License
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-- Built with modern C++23 for performance and maintainability.
-- Leverages industry-standard libraries: `libarchive`, `libssh`, `libcurl`, `zlib`, `jsoncpp`.
-- Inspired by the need for a reliable, cross-platform backup solution.
-
-## Contact
-For issues, feature requests, or questions, please open an issue on the [GitHub repository](https://github.com/genyleap/securevault/issues) or contact [dev@genyleap.com](mailto:dev@genyleap.com).
+No code checkout, CMake build or `ctest` run enables production backup,
+rotates logs, modifies database configuration, or starts an automatic restore.
+A real disaster recovery test on a disposable host is mandatory before
+production use. Keep a separate independently encrypted backup **now**;
+do not depend on unfinished SecureVault development as your sole backup.

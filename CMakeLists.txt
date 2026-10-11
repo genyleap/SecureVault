@@ -1,216 +1,105 @@
-# Minimum CMake version for C++23 and modern features
 cmake_minimum_required(VERSION 3.26)
+project(SecureVault VERSION 2.0 LANGUAGES CXX
+    DESCRIPTION "Native C++23 backup, encrypted storage and disaster recovery")
 
-# Project definition
-project(SecureVault
-    LANGUAGES CXX
-    VERSION 1.0
-    DESCRIPTION "SecureVault Backup System"
-)
-
-# Set C++ standard to 23
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-# Allow CMake to use vcpkg toolchain if specified
-if(DEFINED ENV{VCPKG_ROOT})
-    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
-endif()
+option(SECUREVAULT_BUILD_CORE "Build the tar/database backup engine" ON)
+option(SECUREVAULT_REQUIRE_SFTP "Require libssh for core SFTP" ON)
+option(SECUREVAULT_AUTO_INSTALL_BREW_DEPS "Install Homebrew dependencies automatically" OFF)
 
-# Add custom CMake modules
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
-
-option(SECUREVAULT_AUTO_INSTALL_BREW_DEPS "Automatically install missing Homebrew dependencies on macOS" OFF)
-
-# Install missing Homebrew dependencies before package discovery.
-if(APPLE AND SECUREVAULT_AUTO_INSTALL_BREW_DEPS)
-    find_program(HOMEBREW_EXECUTABLE brew)
-    if(NOT HOMEBREW_EXECUTABLE)
-        message(FATAL_ERROR "Homebrew is required for automatic dependency installation but was not found. Install Homebrew or configure with -DSECUREVAULT_AUTO_INSTALL_BREW_DEPS=OFF.")
-    endif()
-
-    set(SECUREVAULT_BREW_DEPS
-        libarchive
-        curl
-        zlib
-        jsoncpp
-        libssh
-    )
-
-    foreach(DEP IN LISTS SECUREVAULT_BREW_DEPS)
-        execute_process(
-            COMMAND "${HOMEBREW_EXECUTABLE}" list --formula "${DEP}"
-            RESULT_VARIABLE BREW_HAS_DEP
-            OUTPUT_QUIET
-            ERROR_QUIET
-        )
-
-        if(NOT BREW_HAS_DEP EQUAL 0)
-            message(STATUS "Installing missing Homebrew dependency: ${DEP}")
-            execute_process(
-                COMMAND "${HOMEBREW_EXECUTABLE}" install "${DEP}"
-                RESULT_VARIABLE BREW_INSTALL_RESULT
-                OUTPUT_VARIABLE BREW_INSTALL_STDOUT
-                ERROR_VARIABLE BREW_INSTALL_STDERR
-            )
-            if(NOT BREW_INSTALL_RESULT EQUAL 0)
-                message(FATAL_ERROR "Failed to install '${DEP}' with Homebrew.\n${BREW_INSTALL_STDOUT}\n${BREW_INSTALL_STDERR}")
-            endif()
-        endif()
-
-        execute_process(
-            COMMAND "${HOMEBREW_EXECUTABLE}" --prefix "${DEP}"
-            RESULT_VARIABLE BREW_PREFIX_RESULT
-            OUTPUT_VARIABLE BREW_PREFIX_OUTPUT
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-        if(BREW_PREFIX_RESULT EQUAL 0)
-            list(APPEND CMAKE_PREFIX_PATH "${BREW_PREFIX_OUTPUT}")
-        endif()
-    endforeach()
-endif()
-
-# Add Homebrew paths for macOS (keg-only libraries)
 if(APPLE)
-    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libarchive")
-    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libssh")
-    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/curl")
-    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/zlib")
-    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/jsoncpp")
+    list(APPEND CMAKE_PREFIX_PATH
+        /opt/homebrew/opt/libarchive /opt/homebrew/opt/libssh
+        /opt/homebrew/opt/curl /opt/homebrew/opt/zlib
+        /opt/homebrew/opt/jsoncpp)
 endif()
 
-# Find required packages
-find_package(LibArchive REQUIRED)
-find_package(Libssh QUIET MODULE)
-option(SECUREVAULT_REQUIRE_SFTP "Refuse to build without an off-site transfer backend" ON)
-if(SECUREVAULT_REQUIRE_SFTP AND NOT Libssh_FOUND)
-    message(FATAL_ERROR "SFTP backend missing. Install libssh-dev or explicitly set SECUREVAULT_REQUIRE_SFTP=OFF for local-only development.")
-endif()
-find_package(CURL REQUIRED)
-find_package(ZLIB REQUIRED)
 find_package(JsonCpp REQUIRED MODULE)
 
+if(SECUREVAULT_BUILD_CORE)
+    find_package(LibArchive REQUIRED)
+    find_package(Libssh QUIET MODULE)
+    find_package(CURL REQUIRED)
+    find_package(ZLIB REQUIRED)
+    if(SECUREVAULT_REQUIRE_SFTP AND NOT Libssh_FOUND)
+        message(FATAL_ERROR "libssh is required; use SECUREVAULT_REQUIRE_SFTP=OFF only for local development")
+    endif()
+endif()
 
-# SDK/usr/include is implicit in Clang's --sysroot. When FindCURL/ZLIB add
-# it as an explicit -isystem before Homebrew LLVM's libc++, libc++'s C wrapper
-# headers (<wchar.h>, <math.h>, etc.) are skipped by include_next.
-# Remove only that duplicate SDK C include; keep genuine dependency includes.
 if(APPLE)
-    function(securevault_strip_implicit_sdk_headers target_name)
-        if(NOT TARGET "${target_name}")
-            return()
-        endif()
-        get_target_property(_sv_includes "${target_name}" INTERFACE_INCLUDE_DIRECTORIES)
-        if(NOT _sv_includes)
-            return()
-        endif()
-        set(_sv_filtered)
-        foreach(_sv_dir IN LISTS _sv_includes)
-            if(_sv_dir MATCHES "[.]sdk/usr/include/?$")
-                message(STATUS "SecureVault: omit implicit SDK C headers from ${target_name}: ${_sv_dir}")
-            else()
-                list(APPEND _sv_filtered "${_sv_dir}")
+    foreach(libtarget IN ITEMS
+        LibArchive::LibArchive CURL::libcurl ZLIB::ZLIB jsoncpp libssh::libssh)
+        if(TARGET "${libtarget}")
+            get_target_property(dirs "${libtarget}" INTERFACE_INCLUDE_DIRECTORIES)
+            if(dirs)
+                set(clean_dirs)
+                foreach(dir IN LISTS dirs)
+                    if(NOT dir MATCHES "[.]sdk/usr/include/?$")
+                        list(APPEND clean_dirs "${dir}")
+                    endif()
+                endforeach()
+                set_property(TARGET "${libtarget}" PROPERTY
+                    INTERFACE_INCLUDE_DIRECTORIES "${clean_dirs}")
             endif()
-        endforeach()
-        set_property(TARGET "${target_name}" PROPERTY
-            INTERFACE_INCLUDE_DIRECTORIES "${_sv_filtered}")
-    endfunction()
-
-    foreach(_sv_dep_target IN ITEMS
-        LibArchive::LibArchive CURL::libcurl ZLIB::ZLIB
-        jsoncpp libssh::libssh)
-        securevault_strip_implicit_sdk_headers("${_sv_dep_target}")
+        endif()
     endforeach()
 endif()
 
-# Platform-specific definitions
-if(WIN32)
-    add_definitions(-D_WIN32)
-elseif(UNIX AND NOT APPLE)
-    add_definitions(-D_LINUX)
-else()
-    add_definitions(-D_MACOS)
-endif()
+# Native C++23 operations: no scripting runtime required.
+add_library(securevault_operations STATIC
+    src/operations.cpp src/operations_backup.cpp
+    src/operations_pitr.cpp src/operations_binlog.cpp)
+target_include_directories(securevault_operations PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(securevault_operations PUBLIC jsoncpp)
+target_compile_options(securevault_operations PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>)
 
-# Collect source and header files
-set(SOURCE_FILES
-    src/restore.cpp
-    src/backup.cpp
-    src/database_backup.cpp
-    src/file_backup.cpp
-    src/notification.cpp
-    src/backup_config.cpp
-    src/backup_api.cpp
-)
+add_executable(securevault-ops src/ops_main.cpp)
+target_link_libraries(securevault-ops PRIVATE securevault_operations)
 
-if(Libssh_FOUND)
-    list(APPEND SOURCE_FILES src/remote_transfer.cpp)
-else()
-    message(WARNING "Libssh not found: building without SFTP transfer support")
-    list(APPEND SOURCE_FILES src/remote_transfer_stub.cpp)
-endif()
-
-set(HEADER_FILES
-    include/restore.hpp
-    include/backup.hpp
-    include/file_backup.hpp
-    include/remote_transfer.hpp
-    include/notification.hpp
-    include/backup_config.hpp
-    include/backup_api.hpp
-)
-
-# Add main executable
-add_executable(backup ${SOURCE_FILES} ${HEADER_FILES})
-
-# Link libraries for main executable
-target_link_libraries(backup PRIVATE
-    LibArchive::LibArchive
-    CURL::libcurl
-    ZLIB::ZLIB
-    jsoncpp
-)
-
-if(Libssh_FOUND)
-    target_link_libraries(backup PRIVATE libssh::libssh)
-endif()
-
-# Imported library targets supply their own include directories. Do not
-# manually append CURL_INCLUDE_DIRS or ZLIB_INCLUDE_DIRS: they can contain
-# the already-implicit macOS SDK/usr/include and break libc++ header ordering.
-target_include_directories(backup PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-
-# Installation rules
-install(TARGETS backup
-    RUNTIME DESTINATION bin
-)
-
-install(FILES "${CMAKE_SOURCE_DIR}/backup_config.json"
-    DESTINATION etc/securevault
-)
-
-# Set default configuration paths
-set(CONFIG_PATH "backup_config.json")
-
-target_compile_definitions(backup PRIVATE CONFIG_PATH="${CONFIG_PATH}")
-
-# Ensure C++23 support
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|MSVC")
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "13")
-        message(FATAL_ERROR "GCC version must be at least 13 for C++23 support")
-    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "16")
-        message(FATAL_ERROR "Clang version must be at least 16 for C++23 support")
-    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "19.29")
-        message(FATAL_ERROR "MSVC version must be at least 19.29 for C++23 support")
+if(SECUREVAULT_BUILD_CORE)
+    set(core_sources
+        src/restore.cpp src/backup.cpp src/database_backup.cpp
+        src/file_backup.cpp src/notification.cpp src/backup_config.cpp
+        src/backup_api.cpp)
+    if(Libssh_FOUND)
+        list(APPEND core_sources src/remote_transfer.cpp)
+    else()
+        message(WARNING "Building backup without optional SFTP backend")
+        list(APPEND core_sources src/remote_transfer_stub.cpp)
     endif()
-else()
-    message(WARNING "Unknown compiler; C++23 support not guaranteed")
+    add_executable(backup ${core_sources})
+    target_include_directories(backup PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(backup PRIVATE LibArchive::LibArchive
+        CURL::libcurl ZLIB::ZLIB jsoncpp)
+    if(Libssh_FOUND)
+        target_link_libraries(backup PRIVATE libssh::libssh)
+    endif()
+    target_compile_definitions(backup PRIVATE CONFIG_PATH="backup_config.json")
+    target_compile_options(backup PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>)
+    install(TARGETS backup RUNTIME DESTINATION bin)
 endif()
 
-# Enable warnings and optimizations
-target_compile_options(backup PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
-)
+include(CTest)
+if(BUILD_TESTING AND UNIX)
+    add_executable(securevault-native-tests tests/native_tests.cpp)
+    target_link_libraries(securevault-native-tests PRIVATE securevault_operations)
+    target_compile_options(securevault-native-tests PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME securevault-native COMMAND securevault-native-tests)
+    if(SECUREVAULT_BUILD_CORE)
+        add_executable(securevault-backup-tests tests/backup_tests.cpp)
+        target_link_libraries(securevault-backup-tests PRIVATE
+            securevault_operations LibArchive::LibArchive)
+        add_test(NAME securevault-backup
+            COMMAND securevault-backup-tests $<TARGET_FILE:backup>)
+    endif()
+endif()
+
+install(TARGETS securevault-ops RUNTIME DESTINATION bin)
+install(FILES backup_config.json DESTINATION etc/securevault)
+install(FILES DISASTER-RECOVERY.md PITR-READINESS.md DESTINATION share/doc/securevault)

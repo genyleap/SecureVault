@@ -1,109 +1,79 @@
-# PostgreSQL and MariaDB PITR: audit and isolated recovery planning
+# PostgreSQL and MariaDB PITR readiness (native C++23)
 
-> **Development feature, not an active backup or disaster-recovery system.**
-> These commands neither change live database settings nor execute a restore.
-> All destructive database restore operations require separate, human-reviewed
-> runbooks and an independently tested off-host backup.
+The `securevault-ops` C++23 binary inspects local database prerequisites
+with read-only SQL and generates review-only recovery plans. It never runs
+database Restore, changes server configuration, rotates binary logs, or
+installs dependencies.
 
-## Inspect local prerequisites (read-only)
-
-```bash
-python3 scripts/pitr-readiness.py audit
-```
-
-This prints a machine-readable JSON report and exits with 0 only if both
-engines' **local prerequisites** pass. Exit 2 means failed or unavailable
-local checks. Neither exit status verifies recovery from a real independent
-backup location.
-
-The PostgreSQL query is a read-only `SELECT` over `current_setting` and
-`pg_stat_archiver`. It reports:
-
-- `wal_level`, `archive_mode`, `full_page_writes`
-- Whether an archive command or library is configured (the actual command
-  is **not printed**, as it may embed a secret)
-- Archiver success/failure counters
-- Presence of the local `pgbackrest` executable
-
-When invoked as root on Linux, it uses `runuser -u postgres -- psql` for
-the read-only probe. Otherwise the caller must supply adequate PostgreSQL
-connection credentials without embedding secrets in the command line.
-
-The MariaDB query uses `SHOW GLOBAL VARIABLES` and reports:
-
-- Whether binary logging is active and its format
-- `server_id` and binlog retention settings (when supported)
-- Presence of `mariadb-backup` and `mariadb-binlog`/`mysqlbinlog`
-
-The tool does **not** enable WAL archiving or binary logging, install
-packages, rotate logs, call `pg_switch_wal`, or read any application data.
-It does not validate the real database backup repository or its encryption.
-
-## Prepare isolated recovery plans (never executed)
-
-First provision an **isolated recovery machine** and explicitly create
-`/srv/securevault-recovery` there. The planned target must be a new
-nonexistent subdirectory under that path. Examples:
+## Read-only audit
 
 ```bash
-python3 scripts/pitr-readiness.py plan-postgresql \
-  --stanza genyleap \
-  --target-time '2026-10-10T02:00:00+00:00' \
-  --dest /srv/securevault-recovery/postgres-incident-1
-
-python3 scripts/pitr-readiness.py plan-mariadb \
-  --target-time '2026-10-10T02:00:00+00:00' \
-  --dest /srv/securevault-recovery/mariadb-incident-1
+securevault-ops pitr audit
 ```
 
-Output includes `plan_only: true` and `executed: false`. For PostgreSQL it
-contains a **review-only argument vector** for pgBackRest to restore to a
-separate data directory, assuming the operator has already configured a
-valid stanza, archive retention, permissions, matching database version and
-repository on the recovery host. It never invokes pgBackRest.
+The PostgreSQL audit queries `current_setting` and `pg_stat_archiver`
+for `wal_level`, `archive_mode`, `archive_command/archive_library`
+presence (without revealing secret-bearing command text), `full_page_writes`,
+and archiver success/failure counters. It checks for `pgbackrest` in PATH.
 
-For MariaDB it emits a **manual, non-executable checklist** because
-point-in-time recovery requires selecting a consistent base physical backup,
-confirming start binlog coordinates/GTID, ensuring binlog continuity and
-replaying events up to a verified boundary in a separate server. Generating
-blind binlog replay commands would risk data corruption.
+The MariaDB audit uses `SHOW GLOBAL VARIABLES` to inspect `log_bin`,
+`binlog_format` and `server_id`, plus local availability of
+`mariadb-backup` and a binlog replay tool. Results are JSON.
+Even all-local-pass does **not** establish that WAL/binlogs exist remotely
+or that a restore to a given timestamp is possible.
 
-## What is required before calling this PITR-ready
-
-1. An independently stored, recoverable base backup (pgBackRest stanza for
-   PostgreSQL; mariadb-backup for MariaDB).
-2. Continuous off-host shipping and retention of **all** PostgreSQL WAL /
-   MariaDB binary logs needed since the selected base backup.
-3. Permission-limited archive repository, encryption and immutable retention
-   independent of the primary VPS.
-4. Monitoring that detects delayed or missing WAL/binlog segments and failures
-   in storage upload, not just local `archive_mode=on`.
-5. Restoration of both databases in a disposable machine, with deliberate
-   validation of data and application integrity.
-6. Measured RPO/RTO from a simulated failure. This cannot be inferred from
-   successful local configuration checks alone.
-
-### Safety constraints
-
-- Never point the recovery plan at `/var/lib/postgresql`,
-  `/var/lib/mysql` or other live data paths.
-- Never turn on a new binlog/WAL feature in production without a verified
-  restore path and capacity plan. MariaDB binary logging changes might
-  require a database restart; do not perform this during these audits.
-- PostgreSQL `pg_stat_archiver` counters provide evidence of activity,
-  **not** an assurance of remote durability or complete WAL chains.
-- A database logical dump via `pg_dumpall` or `mariadb-dump` alone
-  is not a continuous point-in-time backup.
-- Never perform automatic failover on this project based solely on the
-  report from this script.
-
-## Offline automated tests
+## Isolated, review-only recovery plans
 
 ```bash
-python3 tests/test_pitr_readiness.py
+securevault-ops pitr plan-postgresql --stanza genyleap \
+  --target-time '2026-10-10T02:00:00Z' \
+  --dest /srv/securevault-recovery/new-postgresql
+
+securevault-ops pitr plan-mariadb \
+  --target-time '2026-10-10T02:00:00Z' \
+  --dest /srv/securevault-recovery/new-mariadb
 ```
 
-The tests stub all database clients. They validate safe read-only queries,
-secret-safe failure handling, unsafe configuration reporting, target-time
-validation, path restrictions and generation of review-only plans. They do
-not contact the production VPS or establish actual recoverability.
+The target time must be ISO 8601 with an explicit timezone, must be in
+the past, and the destination must be a previously nonexistent subdirectory
+under an existing `/srv/securevault-recovery` root. The program prints a
+plan and **does not execute it**. Real recovery needs matching database
+versions, verified base backups, an uninterrupted log chain, and a dedicated
+stopped recovery instance. MariaDB requires confirmation of binlog offsets,
+GTIDs and transaction boundaries before any manual replay.
+
+## MariaDB closed-binlog shipping
+
+Create a 0600 JSON configuration stored outside version control, e.g.:
+
+```json
+{
+  "instance_id": "genyleap-main",
+  "binlog_prefix": "mysql-bin",
+  "binlog_dir": "/var/lib/mysql",
+  "state_file": "/var/lib/securevault/binlog-state.json",
+  "db_defaults_file": "/etc/securevault/mariadb-client.cnf"
+}
+```
+
+The `db_defaults_file` must be root-only 0600. Set
+`RESTIC_REPOSITORY` to an independently hosted encrypted Restic repository
+and `RESTIC_PASSWORD_FILE` to a private 0600 key file. No credentials
+are read from command-line arguments or committed to Git.
+
+```bash
+securevault-ops binlog ship --config /etc/securevault/binlog.json
+# Explicitly allow writes only after a verified dry run and base backup:
+securevault-ops binlog ship --config /etc/securevault/binlog.json --execute
+```
+
+Dry-run queries `SHOW BINARY LOGS` and `SHOW MASTER STATUS` and checks
+local closed log availability and continuity. Execute uploads each closed
+binlog as an authenticated encrypted Restic snapshot, compares local
+content-change fingerprints before/after and advances a private state
+checkpoint only after Restic acknowledges the upload.
+
+The **active** MariaDB binlog is not uploaded. Rotating/purging logs is
+not automated. For complete PITR, a separate physical base backup and
+continuous non-gapped shipping must be operational and independently tested;
+the presence of logs or a successful local audit is not enough.
