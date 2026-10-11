@@ -14,8 +14,25 @@ using Snapshot = std::expected<fs::path, std::string>;
 Status initialize(const fs::path& repository);
 Snapshot create(const fs::path& repository, const fs::path& source,
                 const fs::path& password_file);
+// Encrypt PostgreSQL/MariaDB logical dump stdout directly into a snapshot;
+// no intermediate plaintext SQL file and no Restic execution.
+Snapshot create_logical_dump(const fs::path& repository,
+                             const fs::path& password_file,
+                             const std::string& database);
 Status verify(const fs::path& archive, const fs::path& password_file);
 Status restore(const fs::path& archive, const fs::path& target,
                const fs::path& password_file);
 std::expected<std::vector<fs::path>, std::string> list(const fs::path& repository);
+// SHA-256 of the encrypted snapshot bytes; new snapshot filenames are content addressed.
+std::expected<std::string, std::string> ciphertext_digest(const fs::path& archive);
+
+// HTTPS transfer uses a private (0600) file containing a pre-authorized,
+// single-object HTTPS URL. Upload requires conditional create support on
+// the remote endpoint (If-None-Match: *). No shell or Restic subprocesses.
+Status upload_https(const fs::path& archive, const fs::path& password_file,
+                    const fs::path& url_file, const fs::path& ca_bundle = {});
+Snapshot download_https(const fs::path& repository,
+                        const std::string& snapshot_id,
+                        const fs::path& password_file,
+                        const fs::path& url_file, const fs::path& ca_bundle = {});
 }

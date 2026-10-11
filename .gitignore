@@ -54,5 +54,6 @@ build-hardening/
 build-native/
 build-ops/
 build-macos/
+build-macos-native/
 __pycache__/
 *.pyc

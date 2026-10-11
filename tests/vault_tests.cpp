@@ -1,5 +1,6 @@
 #include "vault.hpp"
 #include <array>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -37,7 +38,16 @@ std::string read(const fs::path& p) {
     return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
 }
 } // namespace
-int main() {
+int main(int argc, char** argv) {
+    (void)argc;
+    const auto invoked = fs::path(argv[0]).filename().string();
+    if (invoked == "pg_dumpall" || invoked == "mariadb-dump") {
+        std::cout << (invoked == "pg_dumpall"
+            ? "CREATE ROLE synthetic_role;\\n"
+            : "CREATE DATABASE synthetic_mariadb;\\n");
+        if (std::getenv("SV_TEST_DB_FAIL")) return 21;
+        return 0;
+    }
     Tmp tmp;
     const auto repo = tmp.path / "vault";
     const auto pass = tmp.path / "secret";
@@ -65,6 +75,9 @@ int main() {
         std::cerr << "Native create error: " << archive.error() << '\n';
         return 1;
     }
+    const auto digest = ciphertext_digest(*archive);
+    check(digest && archive->filename().string() == *digest + ".svlt",
+          "New archive IDs are SHA-256 of authenticated ciphertext");
     check(verify(*archive, pass).has_value(), "Authenticates the complete snapshot");
     check(!verify(*archive, wrong), "Rejects a wrong password");
     auto inventory = list(repo);
@@ -74,6 +87,12 @@ int main() {
           "Refuses recursive self-backup when repository lives inside the source");
     check(!create(repo, *archive, pass),
           "Refuses to recursively back up vault snapshot files");
+    const auto source_key = source / "accidental-password";
+    write(source_key, "sensitive-password-file-in-source");
+    chmod(source_key.c_str(), 0600);
+    check(!create(repo, source, source_key),
+          "Refuses snapshots containing their own encryption key file");
+    fs::remove(source_key);
     const auto blob = read(*archive);
     check(blob.find(secret) == std::string::npos, "Encrypted snapshot hides plaintext marker");
     check(blob.find(large.substr(1024, 1024)) == std::string::npos,
@@ -88,10 +107,17 @@ int main() {
     check(read(restore_dir / "nested" / "large.bin") == large,
           "Streaming restores a one-megabyte binary file");
     check(fs::is_directory(restore_dir / "empty"), "Preserves empty directory");
+    const auto nested_mode = fs::status(restore_dir / "nested").permissions();
+    check((static_cast<unsigned>(nested_mode) & 077) == 0,
+          "Restored nested directories have private 0700 permissions");
     check(fs::is_symlink(restore_dir / "link") &&
           fs::read_symlink(restore_dir / "link") == "nested/file.txt",
           "Preserves safe relative symlink");
     check(!restore(*archive, restore_dir, pass), "Refuses to overwrite destination");
+    fs::create_symlink(tmp.path, tmp.path / "linked-parent");
+    check(!restore(*archive, tmp.path / "linked-parent" / "escaped", pass) &&
+          !fs::exists(tmp.path / "escaped"),
+          "Restore rejects a symlinked destination parent");
     check(!restore(*archive, tmp.path / "wrong-key-target", wrong) &&
           !fs::exists(tmp.path / "wrong-key-target"),
           "Wrong key does not publish a destination");
@@ -133,6 +159,64 @@ int main() {
           "Can restore an individual file in a private target directory");
     auto second = list(repo);
     check(second && second->size() == 2, "Two independent native snapshots visible");
+
+    const auto bad_url = tmp.path / "url-file";
+    write(bad_url, "http://127.0.0.1/forbidden\n");
+    chmod(bad_url.c_str(), 0600);
+    check(!upload_https(*archive, pass, bad_url),
+          "Rejects plaintext HTTP upload endpoint");
+    check(!download_https(repo, std::string(32, 'c'), pass, bad_url),
+          "Rejects plaintext HTTP download endpoint");
+    write(bad_url, "https://127.0.0.1:1/offsite/snapshot.svlt\n");
+    chmod(bad_url.c_str(), 0644);
+    check(!upload_https(*archive, pass, bad_url),
+          "Rejects insecure URL credentials file permissions");
+    chmod(bad_url.c_str(), 0600);
+    fs::create_symlink(bad_url, tmp.path / "url-symlink");
+    check(!upload_https(*archive, pass, tmp.path / "url-symlink"),
+          "Rejects URL file symlinks");
+    check(!download_https(repo, "../outside", pass, bad_url),
+          "Rejects unsafe downloaded snapshot IDs");
+    check(!upload_https(corrupt, pass, bad_url),
+          "Rejects unauthenticated encrypted upload source");
+    check(!download_https(repo, std::string(64, 'd'), pass, bad_url) &&
+          !fs::exists(repo / (std::string(64, 'd') + ".svlt")),
+          "HTTPS failure leaves no published encrypted snapshot");
+
+    // Simulate both database programs with THIS C++23 test executable;
+    // stdout flows directly into AES-GCM without touching an SQL temp file.
+    const auto mockbin = tmp.path / "mock-db-bin";
+    fs::create_directory(mockbin);
+    const auto self = fs::canonical(argv[0]);
+    fs::create_symlink(self, mockbin / "pg_dumpall");
+    fs::create_symlink(self, mockbin / "mariadb-dump");
+    const std::string old_path = std::getenv("PATH") ? std::getenv("PATH") : "";
+    const std::string mock_path = mockbin.string() + ":" + old_path;
+    setenv("PATH", mock_path.c_str(), 1);
+    auto pg = create_logical_dump(repo, pass, "postgresql");
+    check(pg && verify(*pg, pass), "PostgreSQL logical stdout encrypted directly");
+    const auto pg_dest = tmp.path / "pg-restored";
+    check(pg && restore(*pg, pg_dest, pass) &&
+          read(pg_dest / "postgresql-all.sql").find("synthetic_role") != std::string::npos,
+          "PostgreSQL logical export restores from authenticated ciphertext");
+    auto maria = create_logical_dump(repo, pass, "mariadb");
+    check(maria && verify(*maria, pass), "MariaDB logical stdout encrypted directly");
+    const auto maria_dest = tmp.path / "maria-restored";
+    check(maria && restore(*maria, maria_dest, pass) &&
+          read(maria_dest / "mariadb-all.sql").find("synthetic_mariadb") != std::string::npos,
+          "MariaDB logical export restores from authenticated ciphertext");
+    check(!create_logical_dump(repo, pass, "unsupported"),
+          "Unexpected database engines are refused");
+    const auto before_failure = list(repo);
+    setenv("SV_TEST_DB_FAIL", "1", 1);
+    check(!create_logical_dump(repo, pass, "postgresql"),
+          "Failed SQL producer cannot publish an encrypted snapshot");
+    unsetenv("SV_TEST_DB_FAIL");
+    const auto after_failure = list(repo);
+    check(before_failure && after_failure &&
+          before_failure->size() == after_failure->size(),
+          "Failed database producer leaves snapshot inventory unchanged");
+    setenv("PATH", old_path.c_str(), 1);
     std::cout << "SecureVault C++23 vault: " << cases - failures
               << "/" << cases << " checks passed\n";
     return failures ? 1 : 0;

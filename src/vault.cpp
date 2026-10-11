@@ -14,9 +14,14 @@
 #include <stdexcept>
 #include <string_view>
 #include <vector>
+#include <utility>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <poll.h>
+#include <chrono>
 #include <unistd.h>
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -27,7 +32,8 @@
 
 namespace securevault::vault {
 namespace {
-constexpr std::array<unsigned char, 8> magic{'S','V','L','T','0','0','1','\0'};
+constexpr std::array<unsigned char, 8> magic_v1{'S','V','L','T','0','0','1','\0'};
+constexpr std::array<unsigned char, 8> magic{'S','V','L','T','0','0','2','\0'};
 constexpr std::array<unsigned char, 8> tree_magic{'S','V','T','R','E','E','0','1'};
 constexpr std::size_t salt_size = 16, nonce_size = 12, tag_size = 16;
 // One AES-GCM invocation must stay strictly below the GCM per-nonce limit.
@@ -188,11 +194,12 @@ public:
         struct stat st{};
         if (fstat(input.value, &st) != 0 || !S_ISREG(st.st_mode) ||
             st.st_nlink != 1 || st.st_size < 36 + static_cast<off_t>(tag_size) ||
-            static_cast<std::uint64_t>(st.st_size) > max_bytes)
+            static_cast<std::uint64_t>(st.st_size) > max_bytes + 52)
             fail("Invalid encrypted archive file");
         remaining = static_cast<std::uint64_t>(st.st_size) - 36 - tag_size;
         read_all(input.value, header);
-        if (!std::equal(magic.begin(), magic.end(), header.begin()))
+        if (!std::equal(magic.begin(), magic.end(), header.begin()) &&
+            !std::equal(magic_v1.begin(), magic_v1.end(), header.begin()))
             fail("Unrecognized snapshot format or version");
         seek_to(input.value, st.st_size - tag_size);
         read_all(input.value, tag);
@@ -356,6 +363,18 @@ void encode_tree(Writer& out, const fs::path& source) {
     }
     out.push(std::array<unsigned char, 1>{0});
 }
+void make_private_parents(const fs::path& stage, const fs::path& relative) {
+    fs::path current = stage;
+    for (const auto& part : relative) {
+        current /= part;
+        if (mkdir(current.c_str(), 0700) != 0 && errno != EEXIST)
+            fail("Cannot create a private restore parent");
+        struct stat st{};
+        if (lstat(current.c_str(), &st) != 0 ||
+            !S_ISDIR(st.st_mode) || (st.st_mode & 077) != 0)
+            fail("Unsafe or non-private restore parent directory");
+    }
+}
 void decode_tree(Reader& in, const fs::path& stage) {
     std::array<unsigned char, 8> prefix{};
     in.take(prefix);
@@ -367,18 +386,21 @@ void decode_tree(Reader& in, const fs::path& stage) {
         if (count > 1000000) fail("Too many archive entries");
         const auto kind = in.byte();
         if (kind == 0) break;
-        if (kind < 1 || kind > 3) fail("Invalid archive entry type");
+        if (kind < 1 || kind > 4) fail("Invalid archive entry type");
         const fs::path rel = text(in, dec_num<std::uint32_t>(in));
         if (!safe_rel(rel) || !seen.insert(rel.generic_string()).second)
             fail("Duplicate or escaping archive path");
         auto target = stage / rel;
-        std::error_code ec;
-        const auto parent = target.parent_path();
-        // Symlinks are materialized only after data and authentication.
-        fs::create_directories(parent, ec);
-        if (ec) fail("Cannot create restore directory");
+        // Materialize only real private 0700 parents. No restored symlink
+        // can be followed because symlinks are created only at the end.
+        make_private_parents(stage, rel.parent_path());
         if (kind == 2) {
-            if (!fs::create_directory(target, ec) && ec) fail("Cannot restore directory");
+            if (mkdir(target.c_str(), 0700) != 0 && errno != EEXIST)
+                fail("Cannot restore private directory");
+            struct stat st{};
+            if (lstat(target.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) ||
+                (st.st_mode & 077) != 0)
+                fail("Restored directory is not a private real directory");
         } else if (kind == 1) {
             auto remaining = dec_num<std::uint64_t>(in);
             if (remaining > max_bytes) fail("Archive entry exceeds maximum size");
@@ -392,6 +414,25 @@ void decode_tree(Reader& in, const fs::path& stage) {
                 remaining -= n;
             }
             if (fsync(out.value) != 0) fail("Restored data cannot be synchronized");
+        } else if (kind == 4) {
+            // Chunked logical database stream. A zero-length chunk terminates
+            // the record. The enclosing AES-GCM tag authenticates all chunks.
+            Fd out(open(target.c_str(), O_WRONLY | O_CREAT | O_EXCL |
+                        O_NOFOLLOW | O_CLOEXEC, 0600));
+            if (out.value < 0) fail("Cannot create private recovered SQL file");
+            std::uint64_t total = 0;
+            std::array<unsigned char, 65536> bytes{};
+            for (;;) {
+                const auto length = dec_num<std::uint32_t>(in);
+                if (length == 0) break;
+                if (length > bytes.size() || length > max_bytes - total)
+                    fail("Invalid encrypted database dump chunk");
+                in.take(std::span(bytes.data(), length));
+                write_all(out.value, std::span(bytes.data(), length));
+                total += length;
+            }
+            if (total == 0 || fsync(out.value) != 0)
+                fail("Empty or unsynchronized recovered SQL export");
         } else {
             std::string link = text(in, dec_num<std::uint32_t>(in));
             const auto pointed = (rel.parent_path() / link).lexically_normal();
@@ -429,21 +470,50 @@ bool valid_repo(const fs::path& root) {
            !fs::is_symlink(st) &&
            (static_cast<unsigned>(st.permissions()) & 077) == 0;
 }
-std::string random_id() {
-    std::array<unsigned char, 16> id{};
-    if (RAND_bytes(id.data(), id.size()) != 1) fail("Cannot generate snapshot ID");
-    constexpr char hex[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(32);
-    for (auto c : id) { out += hex[c >> 4]; out += hex[c & 15]; }
-    return out;
-}
 template <typename F> auto guarded(F&& fn) {
     using Return = decltype(fn());
     try { return fn(); }
     catch (const std::exception& e) { return Return(std::unexpected(e.what())); }
 }
 } // namespace
+
+std::expected<std::string, std::string> ciphertext_digest(const fs::path& archive) {
+    return guarded([&]() -> std::expected<std::string, std::string> {
+        Fd file(open(archive.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
+        if (file.value < 0) fail("Cannot open encrypted snapshot for fingerprint");
+        struct stat st{};
+        if (fstat(file.value, &st) != 0 || !S_ISREG(st.st_mode) ||
+            st.st_nlink != 1 || st.st_size < 52)
+            fail("Snapshot fingerprint requires a regular, non-hardlinked archive");
+        using Digest = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+        Digest context(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+        if (!context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1)
+            fail("SHA-256 digest initialization failed");
+        std::array<unsigned char, 65536> bytes{};
+        while (true) {
+            const ssize_t n = read(file.value, bytes.data(), bytes.size());
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) fail("Cannot read snapshot fingerprint");
+            if (n == 0) break;
+            if (EVP_DigestUpdate(context.get(), bytes.data(),
+                                 static_cast<std::size_t>(n)) != 1)
+                fail("SHA-256 digest failed");
+        }
+        std::array<unsigned char, 32> checksum{};
+        unsigned int actual = 0;
+        if (EVP_DigestFinal_ex(context.get(), checksum.data(), &actual) != 1 ||
+            actual != checksum.size())
+            fail("SHA-256 digest finalization failed");
+        constexpr char hex[] = "0123456789abcdef";
+        std::string id;
+        id.reserve(64);
+        for (auto byte : checksum) {
+            id += hex[byte >> 4];
+            id += hex[byte & 15];
+        }
+        return id;
+    });
+}
 
 Status initialize(const fs::path& repository) {
     return guarded([&]() -> Status {
@@ -474,13 +544,141 @@ Snapshot create(const fs::path& repository, const fs::path& source,
             repo_path.starts_with(source_path + "/") ||
             source_path.starts_with(repo_path + "/"))
             fail("Source and vault repository must be independent directories");
+        const auto actual_pass = fs::weakly_canonical(password_file, ec);
+        if (ec) fail("Cannot inspect password file placement");
+        const auto key_path = actual_pass.string();
+        if (key_path == source_path || key_path.starts_with(source_path + "/") ||
+            key_path.starts_with(repo_path + "/"))
+            fail("Password file must not be inside the source or repository");
         TempFile temp(repository, ".securevault-write-");
         Writer writer(temp.fd, password_file);
         encode_tree(writer, source);
         writer.done();
-        auto dest = repository / (random_id() + ".svlt");
+        const auto fingerprint = ciphertext_digest(temp.name);
+        if (!fingerprint) fail(fingerprint.error());
+        const auto dest = repository / (*fingerprint + ".svlt");
         publish(temp.name, dest);
         temp.name.clear();
+        sync_parent(repository);
+        return dest;
+    });
+}
+Snapshot create_logical_dump(const fs::path& repository,
+                             const fs::path& password_file,
+                             const std::string& database) {
+    return guarded([&]() -> Snapshot {
+        if (!valid_repo(repository))
+            fail("Logical dump requires an existing private Vault repository");
+        std::error_code ec;
+        const auto real_repo = fs::weakly_canonical(repository, ec);
+        if (ec) fail("Cannot inspect logical backup repository");
+        const auto real_key = fs::weakly_canonical(password_file, ec);
+        if (ec || real_key.string().starts_with(real_repo.string() + "/"))
+            fail("Database backup password file must be outside the repository");
+        std::vector<std::string> arguments;
+        std::string filename;
+        if (database == "postgresql") {
+            arguments = {"pg_dumpall"};
+            filename = "postgresql-all.sql";
+        } else if (database == "mariadb") {
+            arguments = {"mariadb-dump", "--all-databases",
+                         "--single-transaction", "--quick", "--routines",
+                         "--events", "--triggers"};
+            filename = "mariadb-all.sql";
+        } else {
+            fail("Only PostgreSQL and MariaDB logical backups are supported");
+        }
+        int ends[2] = {-1, -1};
+        if (pipe(ends) != 0) fail("Cannot create encrypted database stream");
+        const pid_t pid = fork();
+        if (pid < 0) {
+            close(ends[0]); close(ends[1]);
+            fail("Cannot start database dump process");
+        }
+        if (pid == 0) {
+            setpgid(0, 0);
+            close(ends[0]);
+            if (dup2(ends[1], STDOUT_FILENO) < 0) _exit(127);
+            close(ends[1]);
+            const int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+            if (null_fd < 0 ||
+                dup2(null_fd, STDIN_FILENO) < 0 ||
+                dup2(null_fd, STDERR_FILENO) < 0) _exit(127);
+            close(null_fd);
+            std::vector<char*> argv;
+            for (auto& arg : arguments) argv.push_back(arg.data());
+            argv.push_back(nullptr);
+            execvp(argv[0], argv.data());
+            _exit(127);
+        }
+        close(ends[1]);
+        setpgid(pid, pid);
+        struct Producer {
+            pid_t pid;
+            Fd pipe;
+            bool reaped = false;
+            explicit Producer(pid_t child, int read_fd): pid(child), pipe(read_fd) {}
+            ~Producer() {
+                if (!reaped) {
+                    kill(-pid, SIGKILL);
+                    kill(pid, SIGKILL);
+                    int status = 0;
+                    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+                }
+            }
+            void finish() {
+                const int read_fd = std::exchange(pipe.value, -1);
+                // The read end is no longer required; it cannot be leaked.
+                if (read_fd >= 0) close(read_fd);
+                int status = 0;
+                pid_t result;
+                do { result = waitpid(pid, &status, 0); }
+                while (result < 0 && errno == EINTR);
+                if (result == pid) reaped = true;
+                if (result != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+                    fail("Database dump exited unsuccessfully; no snapshot published");
+            }
+        } producer(pid, ends[0]);
+        TempFile stage(repository, ".securevault-db-");
+        Writer writer(stage.fd, password_file);
+        enc_raw(writer, std::string_view(
+            reinterpret_cast<const char*>(tree_magic.data()), tree_magic.size()));
+        writer.push(std::array<unsigned char, 1>{4});
+        enc_num<std::uint32_t>(writer, static_cast<std::uint32_t>(filename.size()));
+        enc_raw(writer, filename);
+        std::array<unsigned char, 65536> buf{};
+        const auto start = std::chrono::steady_clock::now();
+        auto last_progress = start;
+        std::uint64_t produced = 0;
+        while (true) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - start > std::chrono::hours(12) ||
+                now - last_progress > std::chrono::minutes(2))
+                fail("Database dump stalled or exceeded the time limit");
+            pollfd waiting{producer.pipe.value, static_cast<short>(POLLIN | POLLHUP), 0};
+            const int ready = poll(&waiting, 1, 1000);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0) fail("Cannot read encrypted database stream");
+            if (ready == 0) continue;
+            const ssize_t length = read(producer.pipe.value, buf.data(), buf.size());
+            if (length < 0 && errno == EINTR) continue;
+            if (length < 0) fail("Database dump stream read failed");
+            if (length == 0) break;
+            produced += static_cast<std::uint64_t>(length);
+            enc_num<std::uint32_t>(writer, static_cast<std::uint32_t>(length));
+            writer.push(std::span(buf.data(), static_cast<std::size_t>(length)));
+            last_progress = std::chrono::steady_clock::now();
+        }
+        if (produced == 0) fail("Refusing to publish empty database backup");
+        enc_num<std::uint32_t>(writer, 0);
+        writer.push(std::array<unsigned char, 1>{0});
+        writer.done();
+        producer.finish();
+        const auto fingerprint = ciphertext_digest(stage.name);
+        if (!fingerprint) fail(fingerprint.error());
+        const auto dest = repository / (*fingerprint + ".svlt");
+        publish(stage.name, dest);
+        stage.name.clear();
         sync_parent(repository);
         return dest;
     });
@@ -502,8 +700,9 @@ Status restore(const fs::path& archive, const fs::path& target,
         std::error_code ec;
         if (fs::exists(target, ec) || fs::is_symlink(fs::symlink_status(target, ec)))
             fail("Restore target exists or is a symlink");
-        if (!fs::is_directory(target.parent_path(), ec) || ec)
-            fail("Restore parent must already exist");
+        const auto parent_status = fs::symlink_status(target.parent_path(), ec);
+        if (ec || !fs::is_directory(parent_status) || fs::is_symlink(parent_status))
+            fail("Restore parent must be an existing real directory");
         { Reader validation(archive, password_file); validation.authenticate(); }
         TempDir stage(target.parent_path());
         Reader reader(archive, password_file);
@@ -519,8 +718,10 @@ std::expected<std::vector<fs::path>, std::string> list(const fs::path& repositor
         if (!valid_repo(repository)) fail("Repository must be private and non-symlink");
         std::vector<fs::path> result;
         const auto valid = [](std::string s) {
-            if (s.size() != 37 || !s.ends_with(".svlt")) return false;
-            return std::all_of(s.begin(), s.begin() + 32, [](unsigned char ch) {
+            if (!s.ends_with(".svlt") || (s.size() != 37 && s.size() != 69))
+                return false;
+            const auto count = s.size() - 5;
+            return std::all_of(s.begin(), s.begin() + count, [](unsigned char ch) {
                 return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
             });
         };
