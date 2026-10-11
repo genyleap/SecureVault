@@ -25,7 +25,7 @@
 - Database credential temporary files are exclusively created with mode 0600
   on POSIX. Database tools execute without inherited `LD_LIBRARY_PATH`.
 - SFTP uploads use a temporary remote name and publish only after complete
-  transfer. Test coverage is under `tests/` and GitHub Actions CI.
+  transfer. Regression tests are under `tests/`.
 
 **Still missing for production**: authenticated encrypted-at-rest repository,
 point-in-time database recovery using WAL/binlogs, off-host immutable copies,
@@ -93,13 +93,25 @@ cmake --build . --config Release
 cmake --install .
 ```
 
-### Build on macOS
+### Build on macOS (Homebrew LLVM / Apple Silicon)
 ```bash
-mkdir build && cd build
-cmake ..
-make
-sudo make install
+brew install cmake ninja llvm libarchive libssh curl jsoncpp zlib
+cmake -S . -B build/macos-clang -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++ \
+  -DSECUREVAULT_AUTO_INSTALL_BREW_DEPS=OFF
+cmake --build build/macos-clang --parallel
 ```
+
+The Apple SDK C headers are already included by Clang through its sysroot.
+**Do not manually add** `MacOSX.sdk/usr/include` to `CMAKE_CXX_FLAGS`
+or `target_include_directories`: placing it before Homebrew LLVM's
+`libc++` wrappers produces errors such as `<cwctype> ... <wctype.h>`,
+`<cstring> ... <string.h>`, and the `isinf` macro failure.
+The CMake configuration filters accidental SDK C include paths exported by
+dependency targets. For Qt Creator, clear the existing CMake configuration
+or choose a **new build directory** when switching toolchains, then
+reconfigure and rebuild. Qt is not a project dependency.
 
 ## Configuration
 

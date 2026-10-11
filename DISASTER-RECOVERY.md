@@ -89,9 +89,8 @@ python3 tests/test_securevault.py build/backup
 ```
 
 The tests use disposable directories and a fake mysqldump executable.
-They must not connect to live databases. An unactivated GitHub Actions
-workflow template lives in `ci-templates/securevault-ci.yml`. Move this file
-to `.github/workflows/ci.yml` after granting GitHub `workflow` permissions.
+They must not connect to live databases. Run the test suite manually on a
+separate development machine before any production deployment.
 
 Development checkout is not configured to start a service or scheduled backup.
 

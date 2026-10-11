@@ -21,7 +21,7 @@ endif()
 # Add custom CMake modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
-option(SECUREVAULT_AUTO_INSTALL_BREW_DEPS "Automatically install missing Homebrew dependencies on macOS" ON)
+option(SECUREVAULT_AUTO_INSTALL_BREW_DEPS "Automatically install missing Homebrew dependencies on macOS" OFF)
 
 # Install missing Homebrew dependencies before package discovery.
 if(APPLE AND SECUREVAULT_AUTO_INSTALL_BREW_DEPS)
@@ -92,6 +92,39 @@ find_package(CURL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(JsonCpp REQUIRED MODULE)
 
+
+# SDK/usr/include is implicit in Clang's --sysroot. When FindCURL/ZLIB add
+# it as an explicit -isystem before Homebrew LLVM's libc++, libc++'s C wrapper
+# headers (<wchar.h>, <math.h>, etc.) are skipped by include_next.
+# Remove only that duplicate SDK C include; keep genuine dependency includes.
+if(APPLE)
+    function(securevault_strip_implicit_sdk_headers target_name)
+        if(NOT TARGET "${target_name}")
+            return()
+        endif()
+        get_target_property(_sv_includes "${target_name}" INTERFACE_INCLUDE_DIRECTORIES)
+        if(NOT _sv_includes)
+            return()
+        endif()
+        set(_sv_filtered)
+        foreach(_sv_dir IN LISTS _sv_includes)
+            if(_sv_dir MATCHES "[.]sdk/usr/include/?$")
+                message(STATUS "SecureVault: omit implicit SDK C headers from ${target_name}: ${_sv_dir}")
+            else()
+                list(APPEND _sv_filtered "${_sv_dir}")
+            endif()
+        endforeach()
+        set_property(TARGET "${target_name}" PROPERTY
+            INTERFACE_INCLUDE_DIRECTORIES "${_sv_filtered}")
+    endfunction()
+
+    foreach(_sv_dep_target IN ITEMS
+        LibArchive::LibArchive CURL::libcurl ZLIB::ZLIB
+        jsoncpp libssh::libssh)
+        securevault_strip_implicit_sdk_headers("${_sv_dep_target}")
+    endforeach()
+endif()
+
 # Platform-specific definitions
 if(WIN32)
     add_definitions(-D_WIN32)
@@ -142,18 +175,10 @@ if(Libssh_FOUND)
     target_link_libraries(backup PRIVATE libssh::libssh)
 endif()
 
-# Include directories for main executable
-target_include_directories(backup PRIVATE
-    ${LibArchive_INCLUDE_DIRS}
-    ${CURL_INCLUDE_DIRS}
-    ${ZLIB_INCLUDE_DIRS}
-    ${JsonCpp_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/include
-)
-
-if(Libssh_FOUND)
-    target_include_directories(backup PRIVATE ${Libssh_INCLUDE_DIRS})
-endif()
+# Imported library targets supply their own include directories. Do not
+# manually append CURL_INCLUDE_DIRS or ZLIB_INCLUDE_DIRS: they can contain
+# the already-implicit macOS SDK/usr/include and break libc++ header ordering.
+target_include_directories(backup PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 # Installation rules
 install(TARGETS backup
@@ -184,6 +209,6 @@ endif()
 
 # Enable warnings and optimizations
 target_compile_options(backup PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -O2 -std=c++23>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4 /O2 /std:c++latest>
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>
+    $<$<CXX_COMPILER_ID:MSVC>:/W4>
 )
