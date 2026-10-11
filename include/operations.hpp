@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <expected>
 #include <filesystem>
 #include <string>
@@ -11,9 +12,12 @@ namespace fs = std::filesystem;
 struct ProcessResult { int exit_code{}; std::string out; };
 using Result = std::expected<Json::Value, std::string>;
 
-std::expected<ProcessResult, std::string> execute(const std::vector<std::string>& args, bool capture = true);
+std::expected<ProcessResult, std::string> execute(
+    const std::vector<std::string>& args, bool capture = true,
+    std::chrono::seconds timeout = std::chrono::seconds{300});
 std::expected<void, std::string> pipe_processes(
-    const std::vector<std::string>& producer, const std::vector<std::string>& consumer);
+    const std::vector<std::string>& producer, const std::vector<std::string>& consumer,
+    std::chrono::seconds timeout = std::chrono::hours{12});
 bool has_tool(const std::string& name);
 std::expected<void, std::string> private_file(const fs::path& path);
 std::expected<void, std::string> remote_restic();

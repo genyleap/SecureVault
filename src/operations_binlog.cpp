@@ -102,7 +102,7 @@ std::expected<std::string, std::string> upload(const fs::path& path, const std::
                                                const std::string& name) {
     auto result = execute({"restic", "backup", "--json",
         "--tag", "securevault", "--tag", "mariadb-binlog",
-        "--tag", instance, "--tag", name, path.string()});
+        "--tag", instance, "--tag", name, path.string()}, true, std::chrono::hours{2});
     if (!result || result->exit_code) return std::unexpected("Restic binlog upload failed");
     std::string snap;
     std::istringstream lines(result->out);

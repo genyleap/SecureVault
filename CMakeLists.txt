@@ -91,6 +91,17 @@ if(BUILD_TESTING AND UNIX)
     target_compile_options(securevault-native-tests PRIVATE
         $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>)
     add_test(NAME securevault-native COMMAND securevault-native-tests)
+
+    # Runs a REAL Restic roundtrip entirely in a disposable local fixture
+    # repository. Restic is optional; missing binary is a reported skip.
+    add_executable(securevault-restic-e2e-tests tests/restic_e2e_tests.cpp)
+    target_link_libraries(securevault-restic-e2e-tests PRIVATE securevault_operations)
+    target_compile_options(securevault-restic-e2e-tests PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>)
+    add_test(NAME securevault-restic-real COMMAND securevault-restic-e2e-tests)
+    set_tests_properties(securevault-restic-real PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
     if(SECUREVAULT_BUILD_CORE)
         add_executable(securevault-backup-tests tests/backup_tests.cpp)
         target_link_libraries(securevault-backup-tests PRIVATE

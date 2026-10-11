@@ -34,6 +34,33 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
+### Real encrypted-recovery drill (disposable local fixture)
+
+`securevault-restic-real` is an **optional C++23 CTest integration test**
+that uses the actual `restic` executable if available. It initializes an
+encrypted repository **only in a newly created private temporary directory**,
+backs up synthetic files, checks the encrypted data, restores it, compares
+the bytes and symlink, rejects an incorrect password and scans for a known
+plaintext marker. It deletes its own fixture afterward.
+
+```bash
+brew install restic           # Optional dependency on macOS; do this manually
+ctest --test-dir build --output-on-failure -V
+```
+
+If `restic` is not installed, CTest reports this case as **Skipped** rather
+than treating a mock as a real encryption test. This is not an off-site
+recovery drill: SecureVault's production `RESTIC_REPOSITORY` still requires
+an independent remote storage backend, and the local fixture test never
+weakens that requirement.
+
+External subprocesses executed through the native process runner now have
+bounded execution deadlines, including both ends of the piped
+database-dump-to-Restic workflow. Failure or timeout stops the corresponding
+process group and refuses to mark that generation successful. Database/probe
+operations use shorter defaults, while full repository checks, streaming
+dumps and large restores have explicitly longer limits.
+
 On macOS you can explicitly select
 `-DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++`.
 Use a fresh build directory after changing compilers. CMake never installs

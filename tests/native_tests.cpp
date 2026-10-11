@@ -43,6 +43,7 @@ int mocked(int argc, char** argv) {
     const auto name = fs::path(argv[0]).filename().string();
     std::string action = argc > 1 ? argv[1] : "";
     if (name == "restic") {
+        if (action == "stall") { sleep(3); return 0; }
         const std::string a(64, 'a'), b(64, 'b'), c(64, 'c');
         if (action == "snapshots") {
             std::cout << "["
@@ -155,7 +156,24 @@ int main(int argc, char** argv) {
     unsetenv("SV_MOCK_MISSING_MARIA");
     auto integrity = restic_check();
     check(integrity && (*integrity)["checked"].asBool(), "Restic integrity check");
+    // Process deadlines must work with and without captured stdout.
+    auto stalled_output = execute({(bin / "restic").string(), "stall"},
+                                  true, std::chrono::seconds{1});
+    check(!stalled_output && stalled_output.error() == "External command timed out",
+          "Captured external process cannot hang indefinitely");
+    auto stalled_silent = execute({(bin / "restic").string(), "stall"},
+                                  false, std::chrono::seconds{1});
+    check(!stalled_silent && stalled_silent.error() == "External command timed out",
+          "Silent external process cannot hang indefinitely");
+    auto stalled_stream = pipe_processes({(bin / "restic").string(), "stall"},
+        {(bin / "restic").string(), "check"}, std::chrono::seconds{1});
+    check(!stalled_stream && stalled_stream.error().find("timed out") != std::string::npos,
+          "Streaming database backup cannot hang indefinitely");
     setenv("SV_MOCK_CHECK_FAIL", "1", 1);
+    auto failed_stream = pipe_processes({(bin / "restic").string(), "stall"},
+        {(bin / "restic").string(), "check"}, std::chrono::seconds{3});
+    check(!failed_stream && failed_stream.error().find("failed") != std::string::npos,
+          "Streaming stops the producer after consumer failure");
     check(!restic_check(), "Restic data-check failure is fatal");
     unsetenv("SV_MOCK_CHECK_FAIL");
     const auto target = temp.dir / "restored";

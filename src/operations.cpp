@@ -20,6 +20,8 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -133,7 +135,7 @@ std::expected<void, std::string> safe_restored_tree(const fs::path& stage) {
     return {};
 }
 std::expected<Json::Value, std::string> snapshots() {
-    auto r = execute({"restic", "snapshots", "--json", "--tag", "securevault"});
+    auto r = execute({"restic", "snapshots", "--json", "--tag", "securevault"}, true, std::chrono::seconds{300});
     if (!r || r->exit_code) return std::unexpected("Restic inventory failed");
     auto j = parse_json(r->out);
     if (!j || !j->isArray()) return std::unexpected("Restic inventory JSON invalid");
@@ -193,87 +195,197 @@ bool has_tool(const std::string& name) {
     return false;
 }
 std::expected<ProcessResult, std::string> execute(
-    const std::vector<std::string>& args, bool capture) {
+    const std::vector<std::string>& args, bool capture, std::chrono::seconds timeout) {
 #ifdef _WIN32
     return std::unexpected("External process runner requires a POSIX platform");
 #else
-    if (args.empty()) return std::unexpected("Empty external command");
+    if (args.empty() || timeout <= std::chrono::seconds::zero())
+        return std::unexpected("Invalid external process arguments or timeout");
     int fds[2] = {-1, -1};
-    if (capture && pipe(fds) != 0) return std::unexpected("Cannot open process output pipe");
+    if (capture && pipe(fds) != 0)
+        return std::unexpected("Cannot open process output pipe");
     const pid_t pid = fork();
     if (pid < 0) {
         if (capture) { close(fds[0]); close(fds[1]); }
         return std::unexpected("Cannot create child process");
     }
     if (pid == 0) {
+        // A private process group lets a timeout stop descendants too.
+        setpgid(0, 0);
         if (capture) {
             close(fds[0]);
-            dup2(fds[1], STDOUT_FILENO);
+            if (dup2(fds[1], STDOUT_FILENO) < 0) _exit(127);
             close(fds[1]);
         } else {
             const int null_fd = open("/dev/null", O_WRONLY);
-            if (null_fd >= 0) { dup2(null_fd, STDOUT_FILENO); close(null_fd); }
+            if (null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0) _exit(127);
+            close(null_fd);
         }
         const int null_fd = open("/dev/null", O_WRONLY);
-        if (null_fd >= 0) { dup2(null_fd, STDERR_FILENO); close(null_fd); }
+        if (null_fd < 0 || dup2(null_fd, STDERR_FILENO) < 0) _exit(127);
+        close(null_fd);
         std::vector<char*> argv;
-        for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
         argv.push_back(nullptr);
         execvp(argv[0], argv.data());
         _exit(127);
     }
-    std::string out;
-    bool overflow = false;
-    if (capture) {
-        close(fds[1]);
-        std::array<char, 8192> buffer{};
-        ssize_t n;
-        while ((n = read(fds[0], buffer.data(), buffer.size())) > 0) {
-            if (out.size() + static_cast<std::size_t>(n) > output_cap) overflow = true;
-            else if (!overflow) out.append(buffer.data(), static_cast<std::size_t>(n));
-        }
-        close(fds[0]);
-    }
+    // The child attempts the same operation; harmless if it already exec'd.
+    setpgid(pid, pid);
+    if (capture) close(fds[1]);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::string output;
+    std::array<char, 8192> buffer{};
+    bool eof = !capture, reaped = false;
     int status = 0;
-    if (waitpid(pid, &status, 0) < 0) return std::unexpected("Cannot wait for child process");
-    if (overflow) return std::unexpected("External command output exceeded limit");
-    const int code = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
-    return ProcessResult{code, std::move(out)};
+    std::string error;
+    while (!reaped || !eof) {
+        if (!reaped) {
+            const pid_t waited = waitpid(pid, &status, WNOHANG);
+            if (waited == pid) reaped = true;
+            else if (waited < 0 && errno != EINTR) {
+                error = "Cannot wait for external process";
+                break;
+            }
+        }
+        if (reaped && eof) break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            error = "External command timed out";
+            break;
+        }
+        if (!eof) {
+            pollfd reader{fds[0], static_cast<short>(POLLIN | POLLHUP), 0};
+            const int ready = poll(&reader, 1, 25);
+            if (ready < 0 && errno != EINTR) {
+                error = "Cannot read external command output";
+                break;
+            }
+            if (ready > 0 && (reader.revents & (POLLIN | POLLHUP | POLLERR))) {
+                const ssize_t count = read(fds[0], buffer.data(), buffer.size());
+                if (count == 0) eof = true;
+                else if (count < 0 && errno != EINTR) {
+                    error = "Cannot read external command output";
+                    break;
+                } else if (count > 0) {
+                    const auto size = static_cast<std::size_t>(count);
+                    if (size > output_cap - output.size()) {
+                        error = "External command output exceeded limit";
+                        break;
+                    }
+                    output.append(buffer.data(), size);
+                }
+            }
+        } else {
+            // The process may have no captured stdout; still enforce deadline.
+            poll(nullptr, 0, 25);
+        }
+    }
+    if (!error.empty()) {
+        // A child cannot be allowed to keep running after a failed backup.
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL);
+    }
+    if (capture) close(fds[0]);
+    if (!reaped) {
+        pid_t waited;
+        do { waited = waitpid(pid, &status, 0); }
+        while (waited < 0 && errno == EINTR);
+        if (waited < 0 && error.empty()) error = "Cannot reap external process";
+    }
+    if (!error.empty()) return std::unexpected(error);
+    return ProcessResult{WIFEXITED(status) ? WEXITSTATUS(status) : 128, std::move(output)};
 #endif
 }
 std::expected<void, std::string> pipe_processes(
-    const std::vector<std::string>& producer, const std::vector<std::string>& consumer) {
+    const std::vector<std::string>& producer, const std::vector<std::string>& consumer,
+    std::chrono::seconds timeout) {
 #ifdef _WIN32
     return std::unexpected("Streaming requires a POSIX platform");
 #else
-    if (producer.empty() || consumer.empty()) return std::unexpected("Missing stream command");
+    if (producer.empty() || consumer.empty() || timeout <= std::chrono::seconds::zero())
+        return std::unexpected("Invalid streaming command or timeout");
     int p[2];
     if (pipe(p) != 0) return std::unexpected("Cannot create streaming pipe");
     auto launch = [&](const std::vector<std::string>& args, bool src) -> pid_t {
-        pid_t pid = fork();
+        const pid_t pid = fork();
         if (pid == 0) {
-            if (src) dup2(p[1], STDOUT_FILENO);
-            else dup2(p[0], STDIN_FILENO);
+            setpgid(0, 0);
+            if (dup2(src ? p[1] : p[0], src ? STDOUT_FILENO : STDIN_FILENO) < 0)
+                _exit(127);
             close(p[0]); close(p[1]);
             const int null_fd = open("/dev/null", O_WRONLY);
-            if (null_fd >= 0) { dup2(null_fd, STDERR_FILENO); close(null_fd); }
+            if (null_fd < 0 || dup2(null_fd, STDERR_FILENO) < 0) _exit(127);
+            close(null_fd);
             std::vector<char*> argv;
-            for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+            for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
             argv.push_back(nullptr);
             execvp(argv[0], argv.data());
             _exit(127);
         }
+        if (pid > 0) setpgid(pid, pid);
         return pid;
     };
     const pid_t first = launch(producer, true);
-    const pid_t second = first >= 0 ? launch(consumer, false) : -1;
+    const pid_t second = first > 0 ? launch(consumer, false) : -1;
     close(p[0]); close(p[1]);
+    auto stop = [](pid_t pid) {
+        if (pid > 0) {
+            kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+        }
+    };
+    if (first <= 0 || second <= 0) {
+        stop(first);
+        int status = 0;
+        if (first > 0) {
+            pid_t waited;
+            do { waited = waitpid(first, &status, 0); }
+            while (waited < 0 && errno == EINTR);
+        }
+        return std::unexpected("Cannot launch both streaming subprocesses");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    bool first_done = false, second_done = false;
+    bool error = false, expired = false;
     int a = 0, b = 0;
-    if (first > 0) waitpid(first, &a, 0);
-    if (second > 0) waitpid(second, &b, 0);
-    if (first <= 0 || second <= 0 || !WIFEXITED(a) || WEXITSTATUS(a) ||
-        !WIFEXITED(b) || WEXITSTATUS(b))
-        return std::unexpected("Streaming database backup failed; incomplete snapshot is not marked successful");
+    auto wait_one = [&](pid_t pid, bool& done, int& status) {
+        if (done) return;
+        const pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid) {
+            done = true;
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) error = true;
+        } else if (waited < 0 && errno != EINTR) {
+            done = true;
+            error = true;
+        }
+    };
+    while (!first_done || !second_done) {
+        wait_one(first, first_done, a);
+        wait_one(second, second_done, b);
+        if (error) break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            expired = true;
+            break;
+        }
+        if (!first_done || !second_done) poll(nullptr, 0, 25);
+    }
+    if (error || expired) {
+        if (!first_done) stop(first);
+        if (!second_done) stop(second);
+    }
+    auto reap = [](pid_t pid, bool done) {
+        if (done) return;
+        int status = 0;
+        pid_t waited;
+        do { waited = waitpid(pid, &status, 0); }
+        while (waited < 0 && errno == EINTR);
+    };
+    reap(first, first_done);
+    reap(second, second_done);
+    if (expired)
+        return std::unexpected("Streaming backup timed out; incomplete generation refused");
+    if (error)
+        return std::unexpected("Streaming database backup failed; incomplete generation refused");
     return {};
 #endif
 }
@@ -333,7 +445,7 @@ Result restic_generations() {
 Result restic_check() {
     auto ready = remote_restic();
     if (!ready) return std::unexpected(ready.error());
-    const auto result = execute({"restic", "check", "--read-data"}, false);
+    const auto result = execute({"restic", "check", "--read-data"}, false, std::chrono::hours{12});
     if (!result || result->exit_code) return std::unexpected("Restic repository data integrity check failed");
     Json::Value report;
     report["checked"] = true;
@@ -359,7 +471,7 @@ Result restic_restore(const std::string& id, const std::string& kind,
         return std::unexpected("Recovery target must be a new directory under a real existing parent");
     auto stage = make_stage(destination);
     if (!stage) return std::unexpected(stage.error());
-    auto result = execute({"restic", "restore", id, "--target", stage->path.string()}, false);
+    auto result = execute({"restic", "restore", id, "--target", stage->path.string()}, false, std::chrono::hours{12});
     if (!result || result->exit_code) return std::unexpected("Restic isolated restoration failed");
     auto safe = safe_restored_tree(stage->path);
     if (!safe) return std::unexpected(safe.error());

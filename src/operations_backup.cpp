@@ -82,7 +82,7 @@ Result restic_backup() {
     const auto files = execute(
         {"restic", "backup", "--one-file-system", "--exclude-caches",
          "--tag", "securevault", "--tag", "files", "--tag", stamp,
-         "/var/www", "/opt", "/etc", "/boot"}, false);
+         "/var/www", "/opt", "/etc", "/boot"}, false, std::chrono::hours{12});
     if (!files || files->exit_code)
         return std::unexpected("Encrypted off-site file snapshot failed");
     auto saved = save_success("/var/lib/securevault/last_success", stamp);
