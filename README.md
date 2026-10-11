@@ -39,9 +39,16 @@ ctest --test-dir build --output-on-failure
 `securevault-restic-real` is an **optional C++23 CTest integration test**
 that uses the actual `restic` executable if available. It initializes an
 encrypted repository **only in a newly created private temporary directory**,
-backs up synthetic files, checks the encrypted data, restores it, compares
-the bytes and symlink, rejects an incorrect password and scans for a known
-plaintext marker. It deletes its own fixture afterward.
+backs up synthetic files plus separate synthetic PostgreSQL/MariaDB SQL
+fixtures, then creates a v2 generation manifest. It uses the same C++23
+manifest inspector as production to verify that three data snapshots alone
+are INCOMPLETE, that the encrypted marker is read using `restic dump` and
+that the matching four-snapshot generation is COMPLETE. It also checks
+duplicate-marker rejection, repository data integrity, restored bytes and
+relative symlinks, incorrect passwords, and a plaintext-leak smoke check.
+All fixtures are deleted afterward. The production remote-only preflight
+remains mandatory; the local repository is accessible solely to the
+integration harness.
 
 ```bash
 brew install restic           # Optional dependency on macOS; do this manually

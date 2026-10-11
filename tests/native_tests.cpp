@@ -170,6 +170,10 @@ int main(int argc, char** argv) {
           (*groups)[0]["status"].asString() == "COMPLETE" &&
           (*groups)[0]["committed"].asBool(),
           "Generation is complete only when marker contents match all snapshot IDs");
+    auto wrong_marker_root = inspect_restic_generations(*inventory, temp.dir);
+    check(wrong_marker_root && wrong_marker_root->size() == 1 &&
+          (*wrong_marker_root)[0]["status"].asString() == "INCOMPLETE",
+          "Commit manifest outside the approved marker directory is rejected");
     auto ids = restic_generation_snapshot_ids("20261011T090000Z");
     check(ids && (*ids)["files"].asString() == std::string(64, 'a') &&
           (*ids)["mariadb"].asString() == std::string(64, 'c'),

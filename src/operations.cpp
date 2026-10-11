@@ -437,15 +437,16 @@ Result restic_generation_snapshot_ids(const std::string& generation) {
     return ids;
 }
 
-Result restic_generations() {
-    auto inventory = restic_list();
-    if (!inventory) return inventory;
+Result inspect_restic_generations(const Json::Value& inventory,
+                                  const fs::path& expected_marker_directory) {
+    if (!inventory.isArray() || !expected_marker_directory.is_absolute())
+        return std::unexpected("Invalid generation inventory or expected marker directory");
     struct Generation {
         std::map<std::string, std::vector<Json::Value>> kinds;
     };
     std::map<std::string, Generation, std::greater<>> generations;
     const std::regex stamp("^[0-9]{8}T[0-9]{6}Z$");
-    for (const auto& snapshot : *inventory) {
+    for (const auto& snapshot : inventory) {
         std::string generation;
         for (const auto& tag : snapshot["tags"]) {
             if (tag.isString() && std::regex_match(tag.asString(), stamp)) {
@@ -484,7 +485,11 @@ Result restic_generations() {
             const std::string path =
                 paths.isArray() && paths.size() == 1 && paths[0].isString()
                 ? paths[0].asString() : "";
-            if (path.starts_with("/var/lib/securevault/.generation-") &&
+            const fs::path marker_file(path);
+            if (marker_file.is_absolute() &&
+                marker_file.parent_path().lexically_normal() ==
+                    expected_marker_directory.lexically_normal() &&
+                marker_file.filename().string().starts_with(".generation-") &&
                 path.find("..") == std::string::npos &&
                 path.size() < 512) {
                 const auto dump = execute(
@@ -517,6 +522,11 @@ Result restic_generations() {
         result.append(record);
     }
     return result;
+}
+Result restic_generations() {
+    auto inventory = restic_list();
+    if (!inventory) return inventory;
+    return inspect_restic_generations(*inventory, "/var/lib/securevault");
 }
 Result restic_check() {
     auto ready = remote_restic();

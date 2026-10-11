@@ -26,6 +26,10 @@ Json::Value error_json(const std::string& message);
 
 Result restic_list();
 Result restic_generations();
+// Internal integration seam: production always performs remote_restic()
+// before calling this inspector. The test provides a private fixture directory.
+Result inspect_restic_generations(const Json::Value& inventory,
+                                  const fs::path& expected_marker_directory);
 Result restic_generation_snapshot_ids(const std::string& generation);
 Result restic_check();
 Result restic_restore(const std::string& id, const std::string& kind,
