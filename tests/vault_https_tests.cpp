@@ -95,7 +95,7 @@ void send_all(SSL* connection, const std::string& bytes) {
         sent += static_cast<std::size_t>(n);
     }
 }
-enum class Mode { Upload, Download, RejectUpload, RejectDownload };
+enum class Mode { Upload, Download, RejectUpload, RejectDownload, ServerErrorUpload, RedirectDownload };
 void serve_once(int listener, SSL_CTX* context, Mode mode,
                 const fs::path& captured, const std::string& body) {
     const int client = accept(listener, nullptr, nullptr);
@@ -117,7 +117,7 @@ void serve_once(int listener, SSL_CTX* context, Mode mode,
     }
     const auto index = request.find(boundary);
     const auto headers = request.substr(0, index);
-    if (mode == Mode::Upload || mode == Mode::RejectUpload) {
+    if (mode == Mode::Upload || mode == Mode::RejectUpload || mode == Mode::ServerErrorUpload) {
         require(headers.starts_with("PUT ") &&
                 headers.find("If-None-Match: *") != std::string::npos,
                 "Conditional PUT header missing");
@@ -137,6 +137,8 @@ void serve_once(int listener, SSL_CTX* context, Mode mode,
         require(received.size() == length, "Unexpected extra HTTPS upload bytes");
         if (mode == Mode::RejectUpload)
             send_all(ssl, "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        else if (mode == Mode::ServerErrorUpload)
+            send_all(ssl, "HTTP/1.1 500 Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         else {
             put(captured, received);
             send_all(ssl, "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -145,6 +147,8 @@ void serve_once(int listener, SSL_CTX* context, Mode mode,
         require(headers.starts_with("GET "), "Expected a TLS GET request");
         if (mode == Mode::RejectDownload)
             send_all(ssl, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        else if (mode == Mode::RedirectDownload)
+            send_all(ssl, "HTTP/1.1 302 Found\r\nLocation: https://example.invalid/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         else {
             send_all(ssl, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: " +
                       std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n");
@@ -237,6 +241,14 @@ int main() {
                 "Precondition-failed HTTP 412 must reject an upload");
         require(conflict_server.finish(), "TLS 412 response fixture failed");
 
+        Loopback broken_server(context, Mode::ServerErrorUpload, tmp.path / "must-not-upload");
+        put(url_file, "https://localhost:" + std::to_string(broken_server.port) + "/unavailable\n", true);
+        const auto broken = securevault::vault::upload_https(
+            *snapshot, password, url_file, cert);
+        require(!broken && !fs::exists(tmp.path / "must-not-upload"),
+                "HTTP 500 upload failure cannot report a completed off-site backup");
+        require(broken_server.finish(), "TLS 500 upload fixture failed");
+
         const auto original = get(*snapshot);
         const auto replica_repo = tmp.path / "replica-repository";
         require(securevault::vault::initialize(replica_repo).has_value(),
@@ -270,6 +282,17 @@ int main() {
         require(!forbidden && !fs::exists(forbidden_repo / (object_id + ".svlt")),
                 "HTTP 403 cannot publish a remote snapshot");
         require(forbidden_server.finish(), "TLS 403 response fixture failed");
+
+        Loopback redirect_server(context, Mode::RedirectDownload, tmp.path / "unused");
+        put(url_file, "https://localhost:" + std::to_string(redirect_server.port) + "/redirect\n", true);
+        const auto redirect_repo = tmp.path / "redirect-repository";
+        require(securevault::vault::initialize(redirect_repo).has_value(),
+                "Cannot initialize redirect refusal repository");
+        const auto redirected = securevault::vault::download_https(
+            redirect_repo, object_id, password, url_file, cert);
+        require(!redirected && !fs::exists(redirect_repo / (object_id + ".svlt")),
+                "HTTP 302 redirect cannot publish a snapshot");
+        require(redirect_server.finish(), "TLS redirect fixture failed");
 
         // Even a perfectly valid, authenticated SVLT archive must match
         // the particular SHA-256 content ID the caller requested.

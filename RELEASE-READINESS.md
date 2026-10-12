@@ -23,7 +23,8 @@ is not equivalent to proof of business continuity.
   uploaded bytes are SHA-256-checked as they stream from the source
 - Real localhost TLS server fixture built with OpenSSL, with encryption
   roundtrip, received object equality and tampering refusal; rejected
-  uploads (HTTP 412), expired download authorization (HTTP 403), and a
+  uploads (HTTP 412), upstream HTTP 500 failures, expired download
+  authorization (HTTP 403), cross-host redirects (HTTP 302), and a
   valid authenticated archive served under the wrong SHA-256 ID are all
   rejected without publishing a snapshot.
 - Local filesystem tests covering symlinks, hardlinks, path traversal,
